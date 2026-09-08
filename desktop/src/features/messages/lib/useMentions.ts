@@ -2,6 +2,10 @@ import {
   isMentionActionable,
   markMentionCollisions,
 } from "./mentionPresentation";
+import {
+  getMentionSelectionHistory,
+  rememberMentionSelection,
+} from "./mentionSelectionHistory";
 import { useMentionEvidence } from "./useMentionEvidence";
 import * as React from "react";
 import {
@@ -408,6 +412,7 @@ export function useMentions(
       mentionCandidatesWithTeams,
       mentionQuery,
       activePersonaIds,
+      getMentionSelectionHistory(currentPubkey, channelId),
     )
       .slice(0, MENTION_SUGGESTION_LIMIT)
       .map(({ candidate, label }) => ({
@@ -426,6 +431,7 @@ export function useMentions(
     activePersonaIds,
     agentDirectoriesReady,
     retryMention,
+    channelId,
     currentPubkey,
     mentionCandidatesWithTeams,
     mentionQuery,
@@ -572,6 +578,8 @@ export function useMentions(
           replaceToOffset: selectionEnd,
           insertText: "",
         };
+      if (suggestion.pubkey)
+        rememberMentionSelection(currentPubkey, channelId, suggestion.pubkey);
       const [boundSuggestion] = selectedMentionLabels(
         [suggestion],
         mentionMapRef.current,
@@ -646,6 +654,8 @@ export function useMentions(
       knownAgentPubkeys,
       query,
       suggestions,
+      currentPubkey,
+      channelId,
     ],
   );
   const registerMentionPubkey = React.useCallback(
