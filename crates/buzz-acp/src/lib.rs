@@ -2140,9 +2140,29 @@ fn inactivity_expired(
     last_activity: tokio::time::Instant,
     now: tokio::time::Instant,
     bound: Duration,
-    turn_in_flight: bool,
+    work_pending: bool,
 ) -> bool {
-    !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
+    !bound.is_zero() && !work_pending && now.duration_since(last_activity) >= bound
+}
+
+/// Whether the harness may exit after an inactivity bound.
+///
+/// A retry- or usage-limit-throttled batch is not flushable yet, but it is
+/// still promised work. Keep the process alive until that batch can run so an
+/// in-memory hold cannot disappear during graceful inactivity shutdown.
+fn inactivity_exit_due(
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    queue: &EventQueue,
+    heartbeat_in_flight: bool,
+) -> bool {
+    inactivity_expired(
+        last_activity,
+        now,
+        bound,
+        queue.has_in_flight() || queue.has_undispatched_work() || heartbeat_in_flight,
+    )
 }
 
 /// Whether a woken lazy pool may be torn back down to the empty-slot state.
@@ -2212,6 +2232,39 @@ mod inactivity_tests {
             checked,
             Duration::from_secs(60),
             false
+        ));
+    }
+
+    #[test]
+    fn usage_limit_held_batch_blocks_inactivity_shutdown() {
+        let started = tokio::time::Instant::now();
+        let after_bound = started + Duration::from_secs(61);
+        let channel_id = Uuid::new_v4();
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "held request")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        let batch = queue.flush_next().expect("queued batch");
+        assert!(queue
+            .requeue_held(batch, Duration::from_secs(3600))
+            .is_none());
+        queue.mark_complete(channel_id);
+
+        assert!(queue.has_undispatched_work());
+        assert!(!inactivity_exit_due(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            &queue,
+            false,
         ));
     }
 }
@@ -3609,11 +3662,12 @@ async fn tokio_main() -> Result<()> {
                     }
                 } => {
                     let _ = result_rx;
-                    if inactivity_expired(
+                    if inactivity_exit_due(
                         last_activity,
                         tokio::time::Instant::now(),
                         inactivity_bound,
-                        queue.has_in_flight() || heartbeat_in_flight,
+                        &queue,
+                        heartbeat_in_flight,
                     ) {
                         tracing::info!(
                             inactivity_seconds = config.exit_after_inactivity_secs,
@@ -4666,12 +4720,13 @@ const NOTICE_EXCERPT_CHARS: usize = 80;
 /// request into the same channel. The deep link resolves the original event
 /// in Buzz Desktop even when the notice cannot be threaded under it.
 fn describe_batch_events(batch: &FlushBatch, turn_id: &str, config: &Config) -> String {
+    let affected_count = batch.cancelled_events.len() + batch.events.len();
     let mut out = format!(
         "Affected: {} event(s) for {}, turn `{turn_id}`",
-        batch.events.len(),
+        affected_count,
         agent_label(config)
     );
-    for be in &batch.events {
+    for be in batch.cancelled_events.iter().chain(&batch.events) {
         let event = &be.event;
         let mut link = format!(
             "buzz://message?channel={}&id={}",
@@ -11332,20 +11387,42 @@ mod error_outcome_emission_tests {
     #[test]
     fn notice_details_link_the_original_event_with_an_excerpt() {
         let channel_id = uuid::Uuid::new_v4();
-        let batch = one_event_batch(
+        let mut batch = one_event_batch(
             channel_id,
             "@agent please deploy the release to staging\nand ignore this second line",
         );
-        let event = &batch.events[0].event;
+        let carried = nostr::EventBuilder::new(
+            nostr::Kind::Custom(9),
+            "original request interrupted by steering",
+        )
+        .sign_with_keys(&nostr::Keys::generate())
+        .unwrap();
+        batch.cancelled_events.push(BatchEvent {
+            event: carried,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        });
+        batch.cancel_reason = Some(CancelReason::Steer);
+        let current_event = &batch.events[0].event;
+        let carried_event = &batch.cancelled_events[0].event;
         let details = describe_batch_events(&batch, "turn-42", &test_config());
 
-        let link = format!(
+        let current_link = format!(
             "buzz://message?channel={channel_id}&id={}",
-            event.id.to_hex()
+            current_event.id.to_hex()
         );
-        assert!(details.contains(&link), "{details}");
+        let carried_link = format!(
+            "buzz://message?channel={channel_id}&id={}",
+            carried_event.id.to_hex()
+        );
+        assert!(details.contains(&current_link), "{details}");
+        assert!(details.contains(&carried_link), "{details}");
         assert!(details.contains("turn `turn-42`"), "{details}");
-        assert!(details.contains("1 event(s)"), "{details}");
+        assert!(details.contains("2 event(s)"), "{details}");
+        assert!(
+            details.contains("“original request interrupted by steering”"),
+            "{details}"
+        );
         assert!(
             details.contains("“@agent please deploy the release to staging”"),
             "{details}"

@@ -18,10 +18,12 @@
 //!
 //! # Timezone
 //!
-//! The reset time is interpreted in the harness process's local timezone. The
-//! agent CLI is a child of this process on the same host, so the zone it
-//! prints (`(Asia/Seoul)` above) is the same one `chrono::Local` resolves to;
-//! the zone label itself is not parsed.
+//! A reset clock without a zone is interpreted in the harness process's local
+//! timezone. When the provider prints an explicit named zone such as
+//! `(Asia/Seoul)`, this module deliberately falls back to the bounded default
+//! hold rather than silently interpreting that clock in a possibly different
+//! host zone. IANA-zone conversion belongs behind a timezone database, not a
+//! guessed offset.
 
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, TimeZone};
 use std::time::Duration;
@@ -112,6 +114,9 @@ pub(crate) fn parse_reset_time(message: &str, now: DateTime<Local>) -> Option<Da
     let idx = lower.find("reset")?;
     // Join "3:10 am" → "3:10am" so a detached meridiem still parses.
     let rest = lower[idx..].replace(" am", "am").replace(" pm", "pm");
+    if has_explicit_timezone(&rest) {
+        return None;
+    }
 
     let mut time: Option<(u32, u32)> = None;
     let mut date: Option<NaiveDate> = None;
@@ -160,14 +165,45 @@ pub(crate) fn parse_reset_time(message: &str, now: DateTime<Local>) -> Option<Da
         return Some(candidate);
     }
     match (date, day_offset) {
-        // Explicit date already in the past: only possible across a year
-        // boundary (e.g. "resets Jan 2" parsed in late December).
-        (Some(d), _) => local_at(d.with_year(now.year() + 1)?, hour, minute),
+        // Roll an omitted year forward only when the next occurrence is still
+        // within the supported weekly-limit window. A just-expired explicit
+        // date (e.g. Sep 8 at 15:00 observed at 15:00:30) must remain in the
+        // past so `hold_delay` applies only the short reset buffer.
+        (Some(d), _) => {
+            let next_year = local_at(d.with_year(now.year() + 1)?, hour, minute)?;
+            let until_next_year = (next_year - now).to_std().ok()?;
+            if d.month() < now.month() && until_next_year <= Duration::from_secs(MAX_HOLD_SECS) {
+                Some(next_year)
+            } else {
+                Some(candidate)
+            }
+        }
         // "today"/"tomorrow" in the past: take it at face value.
         (None, Some(_)) => Some(candidate),
         // Bare clock time already passed today → next occurrence.
         (None, None) => local_at(base.checked_add_days(Days::new(1))?, hour, minute),
     }
+}
+
+/// Whether the reset clause names a timezone that cannot safely be treated as
+/// the host's local zone. Parenthesized IANA names and common UTC/GMT/offset
+/// forms are recognised; unrelated explanatory parentheses are ignored.
+fn has_explicit_timezone(reset_clause: &str) -> bool {
+    reset_clause.split('(').skip(1).any(|tail| {
+        let Some((label, _)) = tail.split_once(')') else {
+            return false;
+        };
+        let label = label.trim();
+        label.contains('/')
+            || label == "utc"
+            || label == "gmt"
+            || label.starts_with("utc+")
+            || label.starts_with("utc-")
+            || label.starts_with("gmt+")
+            || label.starts_with("gmt-")
+            || label.starts_with('+')
+            || label.starts_with('-')
+    })
 }
 
 fn local_at(date: NaiveDate, hour: u32, minute: u32) -> Option<DateTime<Local>> {
@@ -228,8 +264,7 @@ mod tests {
     use super::*;
     use chrono::Timelike;
 
-    const INCIDENT_MSG: &str =
-        "Internal error: You've hit your session limit · resets 3:10am (Asia/Seoul)";
+    const INCIDENT_MSG: &str = "Internal error: You've hit your session limit · resets 3:10am";
 
     /// 2026-09-03 00:47:46 local — the first failed turn of the incident.
     fn incident_now() -> DateTime<Local> {
@@ -257,6 +292,17 @@ mod tests {
     }
 
     #[test]
+    fn explicit_named_timezone_uses_bounded_fallback_instead_of_host_local_time() {
+        let message = "Internal error: You've hit your session limit · resets 3:10am (Asia/Seoul)";
+        let limit = detect_at(message, incident_now()).expect("usage limit");
+        assert_eq!(limit.resets_at, None);
+        assert_eq!(
+            limit.hold_delay(incident_now()),
+            Duration::from_secs(FALLBACK_HOLD_SECS)
+        );
+    }
+
+    #[test]
     fn clock_time_already_passed_today_rolls_to_tomorrow() {
         let now = incident_now(); // 00:47
         let at = parse_reset_time("hit your limit · resets 12:30am", now).unwrap();
@@ -270,7 +316,7 @@ mod tests {
     #[test]
     fn parses_hour_only_meridiem_and_24h_forms() {
         let now = incident_now();
-        let pm = parse_reset_time("resets 11pm (America/Los_Angeles)", now).unwrap();
+        let pm = parse_reset_time("resets 11pm", now).unwrap();
         assert_eq!((pm.hour(), pm.minute()), (23, 0));
         let noon = parse_reset_time("resets 12pm", now).unwrap();
         assert_eq!(noon.hour(), 12);
@@ -297,6 +343,43 @@ mod tests {
             tomorrow.date_naive(),
             NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
         );
+    }
+
+    #[test]
+    fn just_expired_explicit_date_does_not_roll_forward_a_year() {
+        let now = Local
+            .with_ymd_and_hms(2026, 9, 8, 15, 0, 30)
+            .single()
+            .expect("unambiguous local time");
+        let at = parse_reset_time("resets Sep 8 at 3pm", now).unwrap();
+        assert_eq!(
+            at,
+            Local
+                .with_ymd_and_hms(2026, 9, 8, 15, 0, 0)
+                .single()
+                .unwrap()
+        );
+        assert_eq!(
+            UsageLimit {
+                resets_at: Some(at)
+            }
+            .hold_delay(now),
+            Duration::from_secs(RESET_BUFFER_SECS)
+        );
+    }
+
+    #[test]
+    fn near_year_boundary_date_rolls_into_next_year() {
+        let now = Local
+            .with_ymd_and_hms(2026, 12, 30, 12, 0, 0)
+            .single()
+            .expect("unambiguous local time");
+        let at = parse_reset_time("resets Jan 2 at 3pm", now).unwrap();
+        assert_eq!(
+            at.date_naive(),
+            NaiveDate::from_ymd_opt(2027, 1, 2).unwrap()
+        );
+        assert_eq!((at.hour(), at.minute()), (15, 0));
     }
 
     #[test]
