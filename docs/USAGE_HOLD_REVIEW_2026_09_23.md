@@ -92,3 +92,43 @@ This differs from the previous day's recorded binary hash. `/opt/buzz` returned
 `Permission denied`; no source commit mapping is established. The deployment
 owner must provide the build manifest/source SHA for that binary hash. A changed
 hash alone does not prove that #1 or this follow-up is deployed.
+# Parallel recovery deadline follow-up
+
+The committed e1cf8f57700420e545197d3fc7495ca03525ea20 failed the default
+parallel package run twice at the recovery test's outer 15-second deadline.
+The matched base ef89d7c9677b939b036dcd4e85be9c9c00dd915b passed once.
+The identical relay/recovery blobs do not establish patch independence.
+
+Boundary instrumentation in an isolated head tree measured JSON preparation
+at 1.67s and 1.79s, followed by a 10.00s production send timeout. Both measured
+runs passed; these are not measurements of the historical failures. The new
+overflow test took about 0.56s (thread CPU 0.559s). No causal attribution to
+that test, memory pressure, or another process has been established.
+
+A controlled counterexample added four seconds only before JSON construction:
+preparation took 5.70s and the outer watchdog cancelled recovery at 15.04s,
+before the production write received its ten-second allowance. Other package
+tests passed. This demonstrates a fixture budget collision, not proof of the
+historical contention source. No production timeout or recovery logic changes.
+
+The fixture now pauses its local Tokio clock after the real socket handshake
+and fixture allocation. JSON CPU time no longer spends timer budget. It keeps
+the real unread loopback socket, production ten-second write deadline, outer
+fifteen-second watchdog, loss-cursor assertion and immediate-retry pacing
+assertion. With the same four-second preparation perturbation, the full package
+run passed (956 + 9 + 258 + 2); the write completed via Timeout at virtual
+10.001s. This tests timer semantics, not a real-time scheduling SLA. The large
+fixture remains bounded at eight million kinds; no tests are skipped or forced
+serial, and neither timeout is increased.
+
+Diagnostic logs (implementer's workspace, not portable CI evidence):
+`/home/buzz-hyuncheol/.buzz/.scratch/buzz-budget-instrumented.log`,
+`buzz-budget-captured.log`, `buzz-budget-prep-delay.log`, and
+`buzz-budget-paused-delay.log` in the same directory. Instrumentation and the
+injected delay are isolated diagnostic changes and are not part of this PR.
+
+Mutation check: bypassing the production timeout only for the fixture's large
+frame made the paused-clock test fail at virtual 15.001s (955 ACP passed, one
+failed; the other 9 + 258 + 2 passed; exit 101). Thus clock control does not
+turn an unbounded write into a passing test. Log: `buzz-budget-timeout-mutant.log`
+in the diagnostic directory above. That mutation is not in the implementation.

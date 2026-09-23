@@ -351,6 +351,12 @@ async fn blocked_recovery_write_is_bounded_and_retains_loss() {
     state.active_filters.get_mut(&ch).unwrap().kinds = Some(vec![9; 8_000_000]);
     state.channel_dropped_since.insert(ch, 700);
     let (tx, _rx) = mpsc::channel(1);
+    // Handshake and fixture allocation use real I/O first. Freeze only this
+    // test's runtime clock: JSON preparation must not consume the 5s margin
+    // around the production 10s write deadline under parallel CPU contention.
+    // The real stalled socket still exercises ws_send_timeout; removing that
+    // timeout reaches the unchanged 15s watchdog instead of passing this test.
+    tokio::time::pause();
     let started = tokio::time::Instant::now();
     timeout(
         Duration::from_secs(15),
