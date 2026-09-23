@@ -100,8 +100,10 @@ pub(crate) fn detect_at(message: &str, now: DateTime<Local>) -> Option<UsageLimi
 /// towards recall rather than the precision required of
 /// [`is_auth_error`](crate::is_auth_error).
 pub(crate) fn is_usage_limit_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    (lower.contains("hit your") && lower.contains("limit")) || lower.contains("usage limit")
+    let lower = message.to_ascii_lowercase().replace(['_', '-'], " ");
+    !lower.contains("rate limit")
+        && ((lower.contains("hit your") && lower.contains("limit"))
+            || lower.contains("usage limit"))
 }
 
 /// Parse the reset time named after the word `reset`/`resets` in `message`.
@@ -160,7 +162,7 @@ pub(crate) fn parse_reset_time(message: &str, now: DateTime<Local>) -> Option<Da
         (None, Some(off)) => today.checked_add_days(Days::new(off))?,
         (None, None) => today,
     };
-    let candidate = local_at(base, hour, minute)?;
+    let candidate = local_at(base, hour, minute, now)?;
     if candidate > now {
         return Some(candidate);
     }
@@ -170,7 +172,7 @@ pub(crate) fn parse_reset_time(message: &str, now: DateTime<Local>) -> Option<Da
         // date (e.g. Sep 8 at 15:00 observed at 15:00:30) must remain in the
         // past so `hold_delay` applies only the short reset buffer.
         (Some(d), _) => {
-            let next_year = local_at(d.with_year(now.year() + 1)?, hour, minute)?;
+            let next_year = local_at(d.with_year(now.year() + 1)?, hour, minute, now)?;
             let until_next_year = (next_year - now).to_std().ok()?;
             if d.month() < now.month() && until_next_year <= Duration::from_secs(MAX_HOLD_SECS) {
                 Some(next_year)
@@ -181,7 +183,7 @@ pub(crate) fn parse_reset_time(message: &str, now: DateTime<Local>) -> Option<Da
         // "today"/"tomorrow" in the past: take it at face value.
         (None, Some(_)) => Some(candidate),
         // Bare clock time already passed today → next occurrence.
-        (None, None) => local_at(base.checked_add_days(Days::new(1))?, hour, minute),
+        (None, None) => local_at(base.checked_add_days(Days::new(1))?, hour, minute, now),
     }
 }
 
@@ -206,10 +208,26 @@ fn has_explicit_timezone(reset_clause: &str) -> bool {
     })
 }
 
-fn local_at(date: NaiveDate, hour: u32, minute: u32) -> Option<DateTime<Local>> {
+fn local_at(
+    date: NaiveDate,
+    hour: u32,
+    minute: u32,
+    now: DateTime<Local>,
+) -> Option<DateTime<Local>> {
     let naive = date.and_hms_opt(hour, minute, 0)?;
-    // `earliest` picks the first valid instant across a DST gap/overlap.
-    Local.from_local_datetime(&naive).earliest()
+    select_reset_candidate(Local.from_local_datetime(&naive), now)
+}
+
+fn select_reset_candidate(
+    result: chrono::LocalResult<DateTime<Local>>,
+    now: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    match result {
+        chrono::LocalResult::Ambiguous(first, second) if first <= now && second > now => {
+            Some(second)
+        }
+        result => result.earliest(),
+    }
 }
 
 /// Parse `3:10am`, `3am`, `12pm`, `15:30` into a 24h `(hour, minute)`.
@@ -414,9 +432,72 @@ mod tests {
             "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
             "Usage credits required for 1M context",
             "rate_limit_error: This request would exceed your organization's rate limit",
+            "You've hit your rate limit; retry shortly",
+            "You've hit your rate-limit; retry shortly",
+            "You've hit your rate_limit; retry shortly",
             "Internal error: something else",
         ] {
             assert!(detect_at(msg, incident_now()).is_none(), "{msg}");
         }
+    }
+
+    #[test]
+    fn dst_overlap_uses_the_remaining_future_occurrence() {
+        // Run this same production-parser test in a child, so changing TZ
+        // cannot race the rest of the process's Local::now() users.
+        if std::env::var("BUZZ_DST_FIXTURE").as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "usage_limit::tests::dst_overlap_uses_the_remaining_future_occurrence",
+                ])
+                .env("TZ", "America/New_York")
+                .env("BUZZ_DST_FIXTURE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let now = DateTime::parse_from_rfc3339("2026-11-01T01:15:00-05:00")
+            .unwrap()
+            .with_timezone(&Local);
+        let repeated = now.date_naive().and_hms_opt(1, 30, 0).unwrap();
+        assert!(
+            matches!(
+                Local.from_local_datetime(&repeated),
+                chrono::LocalResult::Ambiguous(_, _)
+            ),
+            "fixture must exercise an actual DST overlap: {:?}",
+            Local.from_local_datetime(&repeated)
+        );
+        let reset = parse_reset_time("resets 1:30am", now).unwrap();
+        assert_eq!((reset - now).num_minutes(), 15);
+    }
+
+    #[test]
+    fn ambiguous_reset_candidate_skips_only_the_elapsed_occurrence() {
+        let at = |s| {
+            DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Local)
+        };
+        let early = at("2026-11-01T01:30:00-04:00");
+        let late = at("2026-11-01T01:30:00-05:00");
+        let between = at("2026-11-01T01:15:00-05:00");
+        assert_eq!(
+            select_reset_candidate(chrono::LocalResult::Ambiguous(early, late), between),
+            Some(late)
+        );
+        assert_eq!(
+            select_reset_candidate(
+                chrono::LocalResult::Ambiguous(early, late),
+                early - chrono::Duration::minutes(1)
+            ),
+            Some(early)
+        );
+        assert_eq!(
+            select_reset_candidate(chrono::LocalResult::None, between),
+            None
+        );
     }
 }

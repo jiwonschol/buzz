@@ -5173,13 +5173,16 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
 
 /// Best-effort: post a visible failure notice (kind:9) to a channel after a
 /// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Errors are logged and swallowed — the
-/// notice must never take down the main loop.
+/// triggering event was threaded. Keep the signed event pending across relay
+/// failures, with bounded backoff, for the supported eight-day usage window.
+/// Retrying the same ID also makes an accepted-but-timed-out POST idempotent.
+/// This task never blocks the prompt loop. Like the queue, it is in-memory.
 pub(crate) async fn post_failure_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
+    retry: bool,
 ) {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
@@ -5215,12 +5218,41 @@ pub(crate) async fn post_failure_notice(
             return;
         }
     };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS);
+    let mut backoff = Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+            Ok(Ok(response))
+                if response
+                    .get("accepted")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false) =>
+            {
+                return
+            }
+            Ok(Ok(_)) => {
+                tracing::warn!(channel = %channel_id, "notice rejected by relay; still pending")
+            }
+            Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice pending: {e}"),
+            Err(_) => tracing::warn!(channel = %channel_id, "failure notice pending after timeout"),
+        }
+        if !retry {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!(channel = %channel_id, event_id = %event.id,
+                "notice could not be delivered within the eight-day retry window");
+            return;
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
     }
 }
+
+#[cfg(test)]
+#[path = "notice_retry_tests.rs"]
+mod notice_retry_tests;
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///

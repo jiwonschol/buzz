@@ -4792,11 +4792,12 @@ fn spawn_notice(
     channel_id: Uuid,
     thread_tags: queue::ThreadTags,
     content: String,
+    retry: bool,
 ) {
     if let Some(rest) = rest_client {
         let rest = rest.clone();
         tokio::spawn(async move {
-            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
+            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content, retry).await;
         });
     }
 }
@@ -4816,7 +4817,7 @@ fn spawn_failure_notice(
         .last()
         .map(|be| queue::parse_thread_tags(&be.event))
         .unwrap_or_default();
-    spawn_notice(rest_client, batch.channel_id, thread_tags, content);
+    spawn_notice(rest_client, batch.channel_id, thread_tags, content, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4980,7 +4981,7 @@ fn handle_prompt_result(
                     let content = format!(
                         "⏳ The provider usage limit was hit, so I couldn't process the last request yet. I'll retry it automatically {when} — no need to re-send.\n\n{details}"
                     );
-                    spawn_notice(rest_client, channel_id, thread_tags, content);
+                    spawn_notice(rest_client, channel_id, thread_tags, content, true);
                 }
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair

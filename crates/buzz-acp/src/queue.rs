@@ -92,7 +92,10 @@ pub(crate) const MAX_RETRIES: u32 = 10;
 /// keeps hitting the limit at every reset — a misparsed time or a permanently
 /// exhausted account — so it cannot be held forever. Holds reset on the
 /// scope's next successful turn, like `retry_counts`.
-pub(crate) const MAX_USAGE_LIMIT_HOLDS: u32 = 24;
+/// Even the shortest production delay (the 90-second reset buffer) must cover
+/// the full eight-day supported window before the count can expire a request.
+pub(crate) const MAX_USAGE_LIMIT_HOLDS: u32 =
+    (crate::usage_limit::MAX_HOLD_SECS / crate::usage_limit::RESET_BUFFER_SECS) as u32 + 1;
 
 /// Base retry delay in seconds (doubled each attempt).
 const BASE_RETRY_DELAY_SECS: u64 = 5;
@@ -229,6 +232,10 @@ pub struct EventQueue {
     /// [`MAX_USAGE_LIMIT_HOLDS`]. Kept apart from `retry_counts` so a hold
     /// never eats into the transient-failure budget.
     usage_limit_holds: HashMap<SessionScope, u32>,
+    /// Requests promised automatic recovery must not be evicted by fresh traffic.
+    protected_events: HashMap<SessionScope, HashSet<nostr::EventId>>,
+    /// All scopes share the provider account behind this harness.
+    account_retry_after: Option<Instant>,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
@@ -270,6 +277,8 @@ impl EventQueue {
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
             usage_limit_holds: HashMap::new(),
+            protected_events: HashMap::new(),
+            account_retry_after: None,
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
@@ -336,7 +345,15 @@ impl EventQueue {
         let queue = self.queues.entry(scope.clone()).or_default();
         // Enforce per-scope depth cap: drop oldest in this partition.
         if queue.len() >= MAX_PENDING_PER_SCOPE {
-            queue.pop_front();
+            let protected = self.protected_events.get(&scope);
+            let Some(index) = queue
+                .iter()
+                .position(|e| protected.is_none_or(|ids| !ids.contains(&e.event.id)))
+            else {
+                tracing::warn!(%channel_id, "queue full of held requests — rejecting new event");
+                return false;
+            };
+            queue.remove(index);
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -369,12 +386,22 @@ impl EventQueue {
             let victim = self
                 .queues
                 .iter()
-                .filter(|(s, q)| s.channel_id() == channel_id && !q.is_empty())
-                .min_by_key(|(_, q)| q.front().unwrap().received_at)
-                .map(|(s, _)| s.clone());
-            let Some(scope) = victim else { break };
+                .filter(|(s, _)| s.channel_id() == channel_id)
+                .flat_map(|(scope, q)| {
+                    q.iter().enumerate().filter_map(|(index, event)| {
+                        (!self
+                            .protected_events
+                            .get(scope)
+                            .is_some_and(|ids| ids.contains(&event.event.id)))
+                        .then_some((scope.clone(), index, event.received_at))
+                    })
+                })
+                .min_by_key(|(_, _, received_at)| *received_at);
+            let Some((scope, index, _)) = victim else {
+                break;
+            };
             if let Some(q) = self.queues.get_mut(&scope) {
-                q.pop_front();
+                q.remove(index);
                 if q.is_empty() {
                     self.queues.remove(&scope);
                 }
@@ -395,6 +422,12 @@ impl EventQueue {
     /// inserts into `in_flight_channels`, and returns the batch.
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
         let now = Instant::now();
+        if self
+            .account_retry_after
+            .is_some_and(|deadline| deadline > now)
+        {
+            return None;
+        }
 
         // Auto-expire any stuck in-flight entries that missed mark_complete.
         let expired: Vec<SessionScope> = self
@@ -445,7 +478,10 @@ impl EventQueue {
                 let cancelled_scope = self
                     .cancelled_batches
                     .keys()
-                    .find(|scope| !self.in_flight_scopes.contains(scope))
+                    .find(|scope| {
+                        !self.in_flight_scopes.contains(scope)
+                            && self.retry_after.get(scope).is_none_or(|&t| t <= now)
+                    })
                     .cloned();
                 match cancelled_scope {
                     Some(scope) => {
@@ -543,10 +579,12 @@ impl EventQueue {
                 self.retry_after.remove(&scope);
                 self.retry_counts.remove(&scope);
                 self.usage_limit_holds.remove(&scope);
+                self.protected_events.remove(&scope);
             }
             None => {
                 self.retry_counts.remove(&scope);
                 self.usage_limit_holds.remove(&scope);
+                self.protected_events.remove(&scope);
             }
         }
     }
@@ -588,6 +626,7 @@ impl EventQueue {
             );
             self.retry_counts.remove(&scope);
             self.usage_limit_holds.remove(&scope);
+            self.protected_events.remove(&scope);
             // Also clear retry_after so fresh traffic on this scope isn't
             // throttled by stale backoff from the discarded poison batch.
             self.retry_after.remove(&scope);
@@ -667,6 +706,11 @@ impl EventQueue {
     pub fn requeue_held(&mut self, batch: FlushBatch, delay: Duration) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
+        let deadline = Instant::now() + delay;
+        self.account_retry_after = Some(
+            self.account_retry_after
+                .map_or(deadline, |old| old.max(deadline)),
+        );
         let hold = {
             let count = self.usage_limit_holds.entry(scope.clone()).or_insert(0);
             *count += 1;
@@ -683,6 +727,7 @@ impl EventQueue {
                 batch.events.len(),
             );
             self.usage_limit_holds.remove(&scope);
+            self.protected_events.remove(&scope);
             self.retry_counts.remove(&scope);
             self.retry_after.remove(&scope);
             return Some(batch);
@@ -697,8 +742,12 @@ impl EventQueue {
             events = batch.events.len(),
             "holding batch until the usage limit resets"
         );
+        self.protected_events
+            .entry(scope.clone())
+            .or_default()
+            .extend(batch.events.iter().map(|event| event.event.id));
         self.requeue_preserve_timestamps(batch);
-        self.retry_after.insert(scope, Instant::now() + delay);
+        self.retry_after.insert(scope, deadline);
         None
     }
 
@@ -799,6 +848,12 @@ impl EventQueue {
     /// full `flush_next` call.
     pub fn has_flushable_work(&mut self) -> bool {
         let now = Instant::now();
+        if self
+            .account_retry_after
+            .is_some_and(|deadline| deadline > now)
+        {
+            return false;
+        }
 
         // Auto-expire stuck in-flight entries (same logic as flush_next).
         let expired: Vec<SessionScope> = self
@@ -829,10 +884,10 @@ impl EventQueue {
             !q.is_empty()
                 && !self.in_flight_scopes.contains(scope)
                 && self.retry_after.get(scope).is_none_or(|&t| t <= now)
-        }) || self
-            .cancelled_batches
-            .keys()
-            .any(|scope| !self.in_flight_scopes.contains(scope))
+        }) || self.cancelled_batches.keys().any(|scope| {
+            !self.in_flight_scopes.contains(scope)
+                && self.retry_after.get(scope).is_none_or(|&t| t <= now)
+        })
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -974,6 +1029,8 @@ impl EventQueue {
         self.retry_counts
             .retain(|s, _| s.channel_id() != channel_id);
         self.usage_limit_holds
+            .retain(|s, _| s.channel_id() != channel_id);
+        self.protected_events
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancelled_batches
             .retain(|s, _| s.channel_id() != channel_id);
@@ -1185,6 +1242,8 @@ impl EventQueue {
                 || self.queues.get(scope).is_some_and(|q| !q.is_empty())
                 || self.in_flight_scopes.contains(scope)
         });
+        self.protected_events
+            .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
     }
 }
 
@@ -6738,6 +6797,87 @@ mod tests {
     }
 
     // ── usage-limit hold ──────────────────────────────────────────────────
+
+    #[test]
+    fn held_request_survives_scope_and_channel_overflow() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        q.push(make_queued(channel, "original request"));
+        let batch = q.flush_next().unwrap();
+        let original = batch.events[0].event.id;
+        q.requeue_held(batch, Duration::from_secs(3600));
+        q.mark_complete(channel);
+        for i in 0..600 {
+            q.push(make_queued(channel, &format!("fresh {i}")));
+        }
+        let mut other = make_queued(channel, "other thread");
+        other.scope = SessionScope::Thread {
+            channel_id: channel,
+            root_event_id: nostr::EventId::all_zeros().to_hex(),
+        };
+        for _ in 0..600 {
+            q.push(other.clone());
+        }
+        assert!(q.queued_event_ids_for_test(channel).contains(&original));
+        assert!(q.channel_event_total(channel) <= MAX_PENDING_PER_CHANNEL);
+        q.retry_after.clear();
+        q.account_retry_after = None;
+        let recovered = q.flush_next().unwrap();
+        assert!(recovered
+            .events
+            .iter()
+            .any(|event| event.event.id == original));
+        q.mark_complete(channel);
+        assert!(q.protected_events.is_empty());
+    }
+
+    #[test]
+    fn usage_hold_gates_fresh_and_cancelled_scopes() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let held = Uuid::new_v4();
+        let cancelled = Uuid::new_v4();
+        q.push(make_queued(cancelled, "cancelled"));
+        let batch = q.flush_next().unwrap();
+        q.requeue_as_cancelled(batch, CancelReason::Steer);
+        q.mark_complete(cancelled);
+        q.push(make_queued(held, "limited"));
+        let batch = q.flush_next().unwrap();
+        q.requeue_held(batch, Duration::from_secs(3600));
+        q.mark_complete(held);
+        q.push(make_queued(Uuid::new_v4(), "new channel"));
+        assert!(!q.has_flushable_work());
+        assert!(q.flush_next().is_none());
+        assert!(q.has_undispatched_work());
+    }
+
+    #[test]
+    fn cancelled_only_fallback_respects_scope_throttle() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        q.push(make_queued(channel, "cancelled"));
+        let batch = q.flush_next().unwrap();
+        q.requeue_as_cancelled(batch, CancelReason::Steer);
+        q.retry_after
+            .insert(conv(channel), Instant::now() + Duration::from_secs(60));
+        q.mark_complete(channel);
+        assert!(!q.has_flushable_work());
+        assert!(q.flush_next().is_none());
+    }
+
+    #[test]
+    fn timezone_fallback_survives_a_week_of_half_hour_retries() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        q.push(make_queued(channel, "weekly request"));
+        for _ in 0..=7 * 24 * 2 {
+            q.retry_after.clear();
+            q.account_retry_after = None;
+            let batch = q.flush_next().unwrap();
+            assert!(q.requeue_held(batch, Duration::from_secs(1800)).is_none());
+            q.mark_complete(channel);
+        }
+        assert_eq!(q.queued_event_count(channel), 1);
+    }
 
     /// A hold keeps the batch queued, throttles the scope for the given delay
     /// and leaves `retry_counts` untouched — the transient-failure budget must

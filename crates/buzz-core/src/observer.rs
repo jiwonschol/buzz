@@ -23,6 +23,8 @@ pub const NIP44_MIN_CONTENT_LEN: usize = 132;
 pub const NIP44_MAX_CONTENT_LEN: usize = 87_472;
 /// Maximum observer plaintext JSON size accepted by the NIP-44 v2 codec.
 pub const OBSERVER_MAX_PLAINTEXT_LEN: usize = 65_536 - 128;
+/// NIP-AO receive limit, independent of the local encoder's padding ceiling.
+pub const OBSERVER_MAX_INBOUND_PLAINTEXT_LEN: usize = 65_535;
 
 /// Errors returned by observer payload encryption/decryption helpers.
 #[derive(Debug, Error)]
@@ -96,11 +98,11 @@ pub fn decrypt_observer_payload<T: DeserializeOwned>(
         &event.pubkey,
         event.content.as_str(),
     )?;
-    if plaintext.len() > OBSERVER_MAX_PLAINTEXT_LEN {
+    if plaintext.len() > OBSERVER_MAX_INBOUND_PLAINTEXT_LEN {
         let got = plaintext.len();
         plaintext.zeroize();
         return Err(ObserverPayloadError::PlaintextTooLarge {
-            max: OBSERVER_MAX_PLAINTEXT_LEN,
+            max: OBSERVER_MAX_INBOUND_PLAINTEXT_LEN,
             got,
         });
     }
@@ -188,6 +190,71 @@ mod tests {
                 assert_eq!(got, NIP44_V2_MAX_PLAINTEXT_LEN + 1);
             }
             other => panic!("expected PlaintextTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_protocol_limit_is_independent_of_the_encoder_limit() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let sender = Keys::generate();
+        let recipient = Keys::generate();
+        let original =
+            serde_json::to_vec(&json_string_with_serialized_len(OBSERVER_MAX_PLAINTEXT_LEN))
+                .unwrap();
+        for len in [
+            OBSERVER_MAX_PLAINTEXT_LEN + 1,
+            OBSERVER_MAX_INBOUND_PLAINTEXT_LEN,
+        ] {
+            // The local encoder cannot emit these sizes. Construct a conforming
+            // peer frame from a known plaintext: both sizes pad to 65,536 bytes,
+            // so XOR the known plaintext difference and authenticate it anew.
+            let encoded = nip44::encrypt(
+                sender.secret_key(),
+                &recipient.public_key(),
+                &original,
+                nip44::Version::V2,
+            )
+            .unwrap();
+            let mut frame = STANDARD.decode(encoded).unwrap();
+            let end = frame.len() - 32;
+            let mut old = (original.len() as u16).to_be_bytes().to_vec();
+            old.extend_from_slice(&original);
+            old.resize(end - 33, 0);
+            let replacement = serde_json::to_vec(&json_string_with_serialized_len(len)).unwrap();
+            let mut new = (len as u16).to_be_bytes().to_vec();
+            new.extend_from_slice(&replacement);
+            new.resize(old.len(), 0);
+            for (index, (a, b)) in old.iter().zip(&new).enumerate() {
+                frame[33 + index] ^= a ^ b;
+            }
+            let conversation =
+                nip44::v2::ConversationKey::derive(sender.secret_key(), &recipient.public_key())
+                    .unwrap();
+            let nonce = &frame[1..33];
+            let mut expanded = Vec::new();
+            let mut previous = Vec::new();
+            for counter in 1..=3u8 {
+                let mut mac = Hmac::<Sha256>::new_from_slice(conversation.as_bytes()).unwrap();
+                mac.update(&previous);
+                mac.update(nonce);
+                mac.update(&[counter]);
+                previous = mac.finalize().into_bytes().to_vec();
+                expanded.extend_from_slice(&previous);
+            }
+            let mut mac = Hmac::<Sha256>::new_from_slice(&expanded[44..76]).unwrap();
+            mac.update(&frame[1..end]);
+            frame[end..].copy_from_slice(&mac.finalize().into_bytes());
+            let event = EventBuilder::new(
+                Kind::Custom(crate::kind::KIND_AGENT_OBSERVER_FRAME as u16),
+                STANDARD.encode(frame),
+            )
+            .sign_with_keys(&sender)
+            .unwrap();
+            let received: String = decrypt_observer_payload(&recipient, &event).unwrap();
+            assert_eq!(received, json_string_with_serialized_len(len));
         }
     }
 }
