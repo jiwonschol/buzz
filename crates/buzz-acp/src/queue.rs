@@ -217,6 +217,8 @@ pub struct FlushBatch {
 ///     if usage_limit_holds[channel] > MAX_USAGE_LIMIT_HOLDS: dead-letter (log ERROR, return batch to caller)
 ///     else: push_front with original received_at, set retry_after = now + delay (the limit's reset)
 /// ```
+type RequestIds = HashSet<nostr::EventId>;
+
 pub struct EventQueue {
     queues: HashMap<SessionScope, VecDeque<QueuedEvent>>,
     in_flight_scopes: HashSet<SessionScope>,
@@ -224,6 +226,7 @@ pub struct EventQueue {
     in_flight_deadlines: HashMap<SessionScope, Instant>,
     /// Number of events in each in-flight batch (for expiry logging).
     in_flight_batch_sizes: HashMap<SessionScope, usize>,
+    in_flight_request_ids: HashMap<SessionScope, RequestIds>,
     retry_after: HashMap<SessionScope, Instant>,
     /// Per-scope retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<SessionScope, u32>,
@@ -235,8 +238,8 @@ pub struct EventQueue {
     /// Absolute retry-window end, retained across worker contention and retries.
     usage_hold_deadlines: HashMap<SessionScope, Instant>,
     /// Requests promised automatic recovery must not be evicted by fresh traffic.
-    protected_events: HashMap<SessionScope, HashSet<nostr::EventId>>,
-    usage_notices_scheduled: HashSet<SessionScope>,
+    protected_events: HashMap<SessionScope, RequestIds>,
+    usage_notices_scheduled: HashMap<SessionScope, RequestIds>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
     account_notice_retry: Option<Instant>,
@@ -280,12 +283,13 @@ impl EventQueue {
             in_flight_scopes: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
+            in_flight_request_ids: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
             usage_limit_holds: HashMap::new(),
             usage_hold_deadlines: HashMap::new(),
             protected_events: HashMap::new(),
-            usage_notices_scheduled: HashSet::new(),
+            usage_notices_scheduled: HashMap::new(),
             account_retry_after: None,
             account_notice_retry: None,
             terminal_notices: Vec::new(),
@@ -360,7 +364,7 @@ impl EventQueue {
             .filter(|(scope, _)| scope.channel_id() == channel_id)
             .map(|(_, count)| *count)
             .sum();
-        if reserved > 0
+        if (reserved > 0 || self.is_account_held())
             && self.channel_event_total(channel_id) + reserved >= MAX_PENDING_PER_CHANNEL
         {
             tracing::warn!(%channel_id, "channel capacity reserved for in-flight requests — rejecting new event");
@@ -368,6 +372,7 @@ impl EventQueue {
         }
         let scope = event.scope.clone();
         let event_id = event.event.id;
+        let account_held = self.is_account_held();
         let queue = self.queues.entry(scope.clone()).or_default();
         // Enforce per-scope depth cap: drop oldest in this partition.
         if queue.len() >= MAX_PENDING_PER_SCOPE {
@@ -388,6 +393,15 @@ impl EventQueue {
             );
         }
         queue.push_back(event);
+        if account_held {
+            self.protected_events
+                .entry(scope.clone())
+                .or_default()
+                .insert(event_id);
+            if let Some(ids) = self.usage_notices_scheduled.get_mut(&scope) {
+                ids.insert(event_id);
+            }
+        }
         // Enforce the aggregate per-channel cap across all scopes so thread
         // partitioning cannot multiply the admitted backlog.
         self.enforce_channel_cap(channel_id);
@@ -487,6 +501,7 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
+            self.in_flight_request_ids.remove(&scope);
             // Recover any withheld goose-native steer events for the expired
             // scope back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -537,6 +552,10 @@ impl EventQueue {
                             .insert(scope.clone(), now + self.in_flight_deadline);
                         self.in_flight_batch_sizes
                             .insert(scope.clone(), cancelled.len());
+                        self.in_flight_request_ids.insert(
+                            scope.clone(),
+                            cancelled.iter().map(|e| e.event.id).collect(),
+                        );
                         return Some(FlushBatch {
                             channel_id: scope.channel_id(),
                             scope,
@@ -583,6 +602,14 @@ impl EventQueue {
         let cancelled_events = self.cancelled_batches.remove(&scope).unwrap_or_default();
         self.in_flight_batch_sizes
             .insert(scope.clone(), events.len() + cancelled_events.len());
+        self.in_flight_request_ids.insert(
+            scope.clone(),
+            events
+                .iter()
+                .chain(&cancelled_events)
+                .map(|e| e.event.id)
+                .collect(),
+        );
         let cancel_reason = if cancelled_events.is_empty() {
             self.cancel_reasons.remove(&scope);
             None
@@ -624,6 +651,7 @@ impl EventQueue {
         self.in_flight_scopes.remove(&scope);
         self.in_flight_deadlines.remove(&scope);
         self.in_flight_batch_sizes.remove(&scope);
+        self.in_flight_request_ids.remove(&scope);
     }
 
     /// Finish a successful or discarded request, independent of new input.
@@ -634,8 +662,7 @@ impl EventQueue {
         self.retry_after.remove(&scope);
         self.retry_counts.remove(&scope);
         self.usage_limit_holds.remove(&scope);
-        self.protected_events.remove(&scope);
-        self.usage_notices_scheduled.remove(&scope);
+        self.compact_request_ownership();
     }
 
     /// Re-queue a batch of events that failed to process.
@@ -676,8 +703,6 @@ impl EventQueue {
             self.retry_counts.remove(&scope);
             self.usage_limit_holds.remove(&scope);
             self.usage_hold_deadlines.remove(&scope);
-            self.protected_events.remove(&scope);
-            self.usage_notices_scheduled.remove(&scope);
             // Also clear retry_after so fresh traffic on this scope isn't
             // throttled by stale backoff from the discarded poison batch.
             self.retry_after.remove(&scope);
@@ -758,8 +783,6 @@ impl EventQueue {
             );
             self.usage_limit_holds.remove(&scope);
             self.usage_hold_deadlines.remove(&scope);
-            self.protected_events.remove(&scope);
-            self.usage_notices_scheduled.remove(&scope);
             self.retry_counts.remove(&scope);
             self.retry_after.remove(&scope);
             return Some(batch);
@@ -805,11 +828,23 @@ impl EventQueue {
     }
 
     pub(crate) fn usage_notice_scheduled(&self, scope: &SessionScope) -> bool {
-        self.usage_notices_scheduled.contains(scope)
+        self.usage_notices_scheduled
+            .get(scope)
+            .is_some_and(|ids| !ids.is_empty())
     }
 
     pub(crate) fn mark_usage_notice_scheduled(&mut self, scope: SessionScope) {
-        self.usage_notices_scheduled.insert(scope);
+        let ids = self.pending_request_ids(&scope);
+        if !ids.is_empty() {
+            self.protected_events
+                .entry(scope.clone())
+                .or_default()
+                .extend(&ids);
+            self.usage_notices_scheduled
+                .entry(scope)
+                .or_default()
+                .extend(ids);
+        }
     }
 
     pub(crate) fn account_notice_candidates(&mut self) -> Vec<QueuedEvent> {
@@ -826,8 +861,22 @@ impl EventQueue {
         let candidates: Vec<_> = self
             .queues
             .iter()
-            .filter(|(scope, _)| !self.usage_notices_scheduled.contains(*scope))
+            .filter(|(scope, _)| !self.usage_notice_scheduled(scope))
             .filter_map(|(_, events)| events.front().cloned())
+            .chain(self.cancelled_batches.iter().filter_map(|(scope, events)| {
+                if self.usage_notice_scheduled(scope)
+                    || self.queues.get(scope).is_some_and(|q| !q.is_empty())
+                {
+                    return None;
+                }
+                events.first().map(|event| QueuedEvent {
+                    channel_id: scope.channel_id(),
+                    scope: scope.clone(),
+                    event: event.event.clone(),
+                    received_at: event.received_at,
+                    prompt_tag: event.prompt_tag.clone(),
+                })
+            }))
             .take(32)
             .collect();
         self.account_notice_retry =
@@ -929,6 +978,21 @@ impl EventQueue {
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
+        if self.is_account_held() {
+            let ids: RequestIds = batch
+                .events
+                .iter()
+                .chain(&batch.cancelled_events)
+                .map(|e| e.event.id)
+                .collect();
+            self.protected_events
+                .entry(scope.clone())
+                .or_default()
+                .extend(&ids);
+            if let Some(notified) = self.usage_notices_scheduled.get_mut(&scope) {
+                notified.extend(ids);
+            }
+        }
 
         // Restore cancelled carryover FIRST so it precedes any carryover a
         // concurrent cancel may have already staged for this scope, preserving
@@ -982,6 +1046,21 @@ impl EventQueue {
     /// `flush_next()`. No retry throttle, no backoff.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
         let scope = batch.scope.clone();
+        if self.is_account_held() {
+            let ids: RequestIds = batch
+                .events
+                .iter()
+                .chain(&batch.cancelled_events)
+                .map(|e| e.event.id)
+                .collect();
+            self.protected_events
+                .entry(scope.clone())
+                .or_default()
+                .extend(&ids);
+            if let Some(notified) = self.usage_notices_scheduled.get_mut(&scope) {
+                notified.extend(ids);
+            }
+        }
         let entry = self.cancelled_batches.entry(scope.clone()).or_default();
         // Preserve any already-cancelled events from a prior cancel (double-cancel).
         entry.extend(batch.cancelled_events);
@@ -1017,6 +1096,7 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
+            self.in_flight_request_ids.remove(&scope);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired scope so they are
             // not permanently orphaned in the side table.
@@ -1199,7 +1279,7 @@ impl EventQueue {
         self.protected_events
             .retain(|s, _| s.channel_id() != channel_id);
         self.usage_notices_scheduled
-            .retain(|s| s.channel_id() != channel_id);
+            .retain(|s, _| s.channel_id() != channel_id);
         self.cancelled_batches
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
@@ -1333,6 +1413,7 @@ impl EventQueue {
                 self.queues.remove(&scope);
             }
         }
+        self.compact_request_ownership();
     }
 
     /// Bulk-release every withheld event for `channel_id` back to the queue
@@ -1417,12 +1498,67 @@ impl EventQueue {
                 || self.cancelled_batches.contains_key(scope)
                 || self.in_flight_scopes.contains(scope)
         });
-        self.protected_events
-            .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
         self.usage_hold_deadlines
             .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
-        self.usage_notices_scheduled
-            .retain(|scope| self.usage_limit_holds.contains_key(scope));
+        self.compact_request_ownership();
+    }
+
+    fn pending_request_ids(&self, scope: &SessionScope) -> RequestIds {
+        self.queues
+            .get(scope)
+            .into_iter()
+            .flatten()
+            .map(|e| e.event.id)
+            .chain(
+                self.cancelled_batches
+                    .get(scope)
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.event.id),
+            )
+            .chain(
+                self.withheld_native_steer
+                    .get(scope)
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.event.id),
+            )
+            .collect()
+    }
+
+    fn compact_request_ownership(&mut self) {
+        let scopes: HashSet<_> = self
+            .protected_events
+            .keys()
+            .chain(self.usage_notices_scheduled.keys())
+            .cloned()
+            .collect();
+        for scope in scopes {
+            let mut live = self.pending_request_ids(&scope);
+            live.extend(self.in_flight_request_ids.get(&scope).into_iter().flatten());
+            for (batch, _, _) in &self.terminal_notices {
+                if batch.scope == scope {
+                    live.extend(
+                        batch
+                            .events
+                            .iter()
+                            .chain(&batch.cancelled_events)
+                            .map(|e| e.event.id),
+                    );
+                }
+            }
+            for map in [
+                &mut self.protected_events,
+                &mut self.usage_notices_scheduled,
+            ] {
+                if let Some(ids) = map.get_mut(&scope) {
+                    ids.retain(|id| live.contains(id));
+                    if ids.is_empty() {
+                        map.remove(&scope);
+                    }
+                }
+            }
+        }
     }
 }
 

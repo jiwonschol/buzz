@@ -217,8 +217,42 @@ fn held_request_survives_scope_and_channel_overflow() {
         .events
         .iter()
         .any(|event| event.event.id == original));
-    q.mark_complete(channel);
+    q.finish_request(conv(channel));
+    assert!(!q.protected_events.get(&conv(channel)).is_some_and(|ids| ids.contains(&original)));
+    // Later requests accepted during the hold still own their protection.
+    let pending = q.queued_event_ids_for_test(channel);
+    assert!(!pending.is_empty());
+    assert!(pending.iter().all(|id| q.protected_events.get(&conv(channel)).is_some_and(|ids| ids.contains(id))));
+}
+
+#[test]
+fn notice_ids_survive_cancel_requeue_and_other_scope_completion() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    q.hold_account(Duration::from_secs(3600));
+    q.push(make_queued(a, "a"));
+    q.push(make_queued(b, "b"));
+    q.mark_usage_notice_scheduled(conv(a));
+    q.mark_usage_notice_scheduled(conv(b));
+    q.expire_retry_for_test();
+    let batch = q.flush_next().unwrap();
+    let active = batch.scope.clone();
+    let other = if active == conv(a) { conv(b) } else { conv(a) };
+    q.requeue_as_cancelled(batch, CancelReason::Interrupt);
+    q.release_in_flight(&active);
+    q.compact_expired_state();
+    assert!(q.usage_notice_scheduled(&active));
+    assert!(q.usage_notice_scheduled(&other));
+    while let Some(batch) = q.flush_next() {
+        let finished = batch.scope;
+        q.finish_request(finished.clone());
+        assert!(!q.usage_notice_scheduled(&finished));
+    }
+    q.compact_expired_state();
     assert!(q.protected_events.is_empty());
+    assert!(q.usage_notices_scheduled.is_empty());
+    assert!(q.in_flight_request_ids.is_empty());
 }
 
 #[test]

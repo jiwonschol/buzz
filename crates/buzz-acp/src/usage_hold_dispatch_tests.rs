@@ -143,6 +143,58 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
 }
 
 #[tokio::test]
+async fn account_notice_protects_the_notified_request() {
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..pool::test_prompt_context().rest_client };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    queue.hold_account(Duration::from_secs(3600));
+    let first = one_event_batch(channel, "notified");
+    let id = first.events[0].event.id;
+    queue.requeue_preserve_timestamps(first);
+    retry_terminal_notices(&mut queue, Some(&rest));
+    for _ in 0..500 {
+        queue.push(QueuedEvent { channel_id: channel, scope: scope.clone(),
+            event: one_event_batch(channel, "later").events.pop().unwrap().event,
+            received_at: std::time::Instant::now(), prompt_tag: "test".into() });
+    }
+    assert!(queue.queued_event_ids_for_test(scope).contains(&id));
+}
+
+#[tokio::test]
+async fn old_completion_preserves_followup_notice() {
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..pool::test_prompt_context().rest_client };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "old"));
+    queue.flush_next().unwrap();
+    queue.hold_account(Duration::from_secs(3600));
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "new"));
+    retry_terminal_notices(&mut queue, Some(&rest));
+    queue.finish_request(scope.clone());
+    assert!(queue.usage_notice_scheduled(&scope));
+    queue.expire_retry_for_test();
+    queue.flush_next().unwrap();
+    queue.finish_request(scope.clone());
+    assert!(!queue.usage_notice_scheduled(&scope));
+}
+
+#[tokio::test]
+async fn maintenance_preserves_account_notice_without_request_hold() {
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..pool::test_prompt_context().rest_client };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    queue.hold_account(Duration::from_secs(3600));
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "new"));
+    retry_terminal_notices(&mut queue, Some(&rest));
+    queue.compact_expired_state();
+    assert!(queue.usage_notice_scheduled(&scope));
+    assert_eq!(queue.usage_limit_holds(channel), 0);
+}
+
+#[tokio::test]
 async fn successful_retry_clears_hold_with_new_input_before_timer_consumption() {
     let channel = Uuid::new_v4();
     let scope = scope::SessionScope::Conversation { channel_id: channel };
