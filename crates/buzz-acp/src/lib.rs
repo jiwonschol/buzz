@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod notice_outbox;
 mod observer;
 mod pi_launcher;
 mod pool;
@@ -643,7 +644,7 @@ impl QueuedNormalListenerEvent {
         queue: &mut EventQueue,
         steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
     ) {
-        if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
+        if !self.accepted || queue.is_account_held() || !queue.is_scope_in_flight(&self.scope) {
             return;
         }
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
@@ -2682,6 +2683,7 @@ async fn tokio_main() -> Result<()> {
     tracing::info!("connected to relay at {}", config.relay_url);
 
     let relay_rest_client = relay.rest_client();
+    let notice_outbox_task = tokio::spawn(notice_outbox::run(relay_rest_client.clone()));
     let mut author_gate_ctx =
         InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
 
@@ -3062,6 +3064,7 @@ async fn tokio_main() -> Result<()> {
         HoldDeadline,
     }
 
+    let mut loop_failure = None;
     loop {
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -3743,8 +3746,8 @@ async fn tokio_main() -> Result<()> {
                         {
                             typing_channels.insert(scope, thread_tags);
                         }
-                    } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                    } else if !queue.is_account_held() && pool.any_idle() {
+                        dispatch_heartbeat(&mut pool, &queue, &ctx, &mut heartbeat_in_flight);
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -3809,7 +3812,7 @@ async fn tokio_main() -> Result<()> {
                 if let Some(scope) = result.source.scope() {
                     typing_channels.remove(scope);
                 }
-                if handle_prompt_result(
+                let action = handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3821,9 +3824,14 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
-                {
-                    break;
+                );
+                match action {
+                    LoopAction::Continue => {}
+                    LoopAction::Exit => break,
+                    LoopAction::Failed(error) => {
+                        loop_failure = Some(error);
+                        break;
+                    }
                 }
                 if drain_ready_join_results(
                     &mut pool,
@@ -4226,13 +4234,18 @@ async fn tokio_main() -> Result<()> {
     drop(pi_launch_override);
 
     tracing::info!("buzz-acp stopped");
-    Ok(())
+    notice_outbox_task.abort();
+    match loop_failure {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(()),
+    }
 }
 
 #[derive(PartialEq)]
 enum LoopAction {
     Continue,
     Exit,
+    Failed(String),
 }
 
 fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
@@ -4553,7 +4566,7 @@ fn dispatch_pending(
                 let pending = queue.pending_channels();
                 tracing::debug!(pending_channels = pending, "pool_exhausted");
                 queue.requeue_preserve_timestamps(batch);
-                queue.mark_complete(&scope);
+                queue.release_in_flight(&scope);
                 break;
             }
         };
@@ -4652,12 +4665,12 @@ fn dispatch_pending(
     }
     // Release held batches back to the queue (owner busy). They were flushed
     // out (in-flight) so they could not be re-picked above; requeue preserves
-    // their timestamps and mark_complete clears the in-flight marker, leaving
+    // their timestamps and release_in_flight clears the in-flight marker, leaving
     // them queued for the next dispatch when the owner frees up.
     for batch in held {
         let scope = batch.scope.clone();
         queue.requeue_preserve_timestamps(batch);
-        queue.mark_complete(scope);
+        queue.release_in_flight(scope);
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
@@ -4792,12 +4805,11 @@ fn spawn_notice(
     channel_id: Uuid,
     thread_tags: queue::ThreadTags,
     content: String,
-    retry: bool,
 ) {
     if let Some(rest) = rest_client {
         let rest = rest.clone();
         tokio::spawn(async move {
-            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content, retry).await;
+            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
         });
     }
 }
@@ -4817,7 +4829,7 @@ fn spawn_failure_notice(
         .last()
         .map(|be| queue::parse_thread_tags(&be.event))
         .unwrap_or_default();
-    spawn_notice(rest_client, batch.channel_id, thread_tags, content, false);
+    spawn_notice(rest_client, batch.channel_id, thread_tags, content);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4967,8 +4979,8 @@ fn handle_prompt_result(
                 let first_hold = queue.usage_limit_holds(&batch.scope) == 0;
                 if let Some(dead) = queue.requeue_held(batch, delay) {
                     let content = format!(
-                        "⚠️ I couldn't process the last request: the provider usage limit was still in force after {} waits for it to reset. Please re-send if it's still needed.\n\n{details}",
-                        queue::MAX_USAGE_LIMIT_HOLDS
+                        "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
+                        usage_limit::MAX_HOLD_SECS / 86_400
                     );
                     spawn_failure_notice(rest_client, &dead, content);
                 } else if first_hold {
@@ -4979,9 +4991,20 @@ fn handle_prompt_result(
                         None => format!("in about {} minutes", delay.as_secs().div_ceil(60)),
                     };
                     let content = format!(
-                        "⏳ The provider usage limit was hit, so I couldn't process the last request yet. I'll retry it automatically {when} — no need to re-send.\n\n{details}"
+                        "⏳ At {}, the provider usage limit paused this request. It was queued for automatic retry {when} while this harness stays running. If the harness restarts, please re-send. This notice may arrive late and does not confirm completion.\n\n{details}",
+                        chrono::Utc::now().to_rfc3339()
                     );
-                    spawn_notice(rest_client, channel_id, thread_tags, content, true);
+                    if let Some(rest) = rest_client {
+                        let saved =
+                            pool::build_failure_notice(rest, channel_id, &thread_tags, &content)
+                                .and_then(|event| notice_outbox::enqueue(rest, event));
+                        if let Err(error) = saved {
+                            pool.return_agent(result.agent);
+                            return LoopAction::Failed(format!(
+                                "persist usage-limit notice: {error:#}"
+                            ));
+                        }
+                    }
                 }
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -5417,10 +5440,11 @@ fn drain_ready_join_results(
 
 fn dispatch_heartbeat(
     pool: &mut AgentPool,
+    queue: &EventQueue,
     ctx: &Arc<PromptContext>,
     heartbeat_in_flight: &mut bool,
 ) {
-    if *heartbeat_in_flight {
+    if *heartbeat_in_flight || queue.is_account_held() {
         return;
     }
     let agent = match pool.try_claim(None) {
@@ -9660,6 +9684,8 @@ mod error_outcome_emission_tests {
         let generation = pool.record_scope_owner(scope.clone(), agent.index);
         agent.state.set_scope_owner_generation(scope, generation);
     }
+
+    include!("usage_hold_dispatch_tests.rs");
 
     #[tokio::test]
     async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {

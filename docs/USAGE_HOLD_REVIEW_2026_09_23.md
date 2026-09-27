@@ -1,5 +1,9 @@
 # Usage hold review follow-up
 
+Later review fixes and the current notice persistence contract are recorded in
+[the follow-up review](USAGE_HOLD_REVIEW_2026_09_27.md). The results below describe
+the earlier implementation, including its former in-memory notice limitation.
+
 This branch supplements jiwonschol/buzz#1 at
 `ef89d7c9677b939b036dcd4e85be9c9c00dd915b`. Ownership of the original active
 implementation session was not confirmed. The original branch is untouched;

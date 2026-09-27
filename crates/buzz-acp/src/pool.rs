@@ -5171,19 +5171,13 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Keep the signed event pending across relay
-/// failures, with bounded backoff, for the supported eight-day usage window.
-/// Retrying the same ID also makes an accepted-but-timed-out POST idempotent.
-/// This task never blocks the prompt loop. Like the queue, it is in-memory.
-pub(crate) async fn post_failure_notice(
+/// Build a notice before enqueueing it durably or attempting best-effort delivery.
+pub(crate) fn build_failure_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
-    retry: bool,
-) {
+) -> anyhow::Result<nostr::Event> {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
         let parent_id = thread_tags
@@ -5196,7 +5190,7 @@ pub(crate) async fn post_failure_notice(
             parent_event_id: parent_id,
         })
     });
-    let builder = match buzz_sdk::build_message(
+    let builder = buzz_sdk::build_message(
         channel_id,
         content,
         thread_ref.as_ref(),
@@ -5204,55 +5198,38 @@ pub(crate) async fn post_failure_notice(
         false,
         &[],
         &[],
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
-            return;
-        }
-    };
-    let event = match builder.sign_with_keys(&rest.keys) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
-            return;
-        }
-    };
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS);
-    let mut backoff = Duration::from_secs(5);
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-            Ok(Ok(response))
-                if response
-                    .get("accepted")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(false) =>
-            {
-                return
-            }
-            Ok(Ok(_)) => {
-                tracing::warn!(channel = %channel_id, "notice rejected by relay; still pending")
-            }
-            Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice pending: {e}"),
-            Err(_) => tracing::warn!(channel = %channel_id, "failure notice pending after timeout"),
-        }
-        if !retry {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            tracing::error!(channel = %channel_id, event_id = %event.id,
-                "notice could not be delivered within the eight-day retry window");
-            return;
-        }
-        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
-        backoff = (backoff * 2).min(Duration::from_secs(300));
-    }
+    )?;
+    Ok(builder.sign_with_keys(&rest.keys)?)
 }
 
-#[cfg(test)]
-#[path = "notice_retry_tests.rs"]
-mod notice_retry_tests;
+/// Best-effort delivery for non-retrying failure notices. Durable usage-hold
+/// notices are synchronously enqueued by the caller before returning.
+pub(crate) async fn post_failure_notice(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) {
+    let event = match build_failure_notice(rest, channel_id, thread_tags, content) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::error!(%error, "failure notice build failed");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(response))
+            if response
+                .get("accepted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) => {}
+        Ok(Ok(_)) => {
+            tracing::warn!(channel = %channel_id, "notice rejected by relay; still pending")
+        }
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice pending: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "failure notice pending after timeout"),
+    }
+}
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
@@ -5367,6 +5344,11 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
         }))
         .await;
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_prompt_context() -> PromptContext {
+    tests::make_prompt_context_no_owner()
 }
 
 #[cfg(test)]

@@ -101,9 +101,10 @@ pub(crate) fn detect_at(message: &str, now: DateTime<Local>) -> Option<UsageLimi
 /// [`is_auth_error`](crate::is_auth_error).
 pub(crate) fn is_usage_limit_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase().replace(['_', '-'], " ");
-    !lower.contains("rate limit")
-        && ((lower.contains("hit your") && lower.contains("limit"))
-            || lower.contains("usage limit"))
+    lower.contains("usage limit")
+        || lower.contains("session limit")
+        || lower.contains("weekly limit")
+        || (!lower.contains("rate limit") && lower.contains("hit your") && lower.contains("limit"))
 }
 
 /// Parse the reset time named after the word `reset`/`resets` in `message`.
@@ -438,6 +439,18 @@ mod tests {
             "Internal error: something else",
         ] {
             assert!(detect_at(msg, incident_now()).is_none(), "{msg}");
+        }
+    }
+
+    #[test]
+    fn explicit_usage_exhaustion_survives_rate_limit_wrappers() {
+        for phrase in [
+            "You've hit your usage limit",
+            "session limit",
+            "weekly limit",
+        ] {
+            let message = format!("rate_limit_error: {phrase} · resets 3am");
+            assert!(detect_at(&message, incident_now()).is_some(), "{message}");
         }
     }
 
