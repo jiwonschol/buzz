@@ -199,7 +199,7 @@ async fn stale_notice_already_accepted_is_not_posted_again() {
 }
 
 #[tokio::test]
-async fn invalid_lookup_preserves_old_identity_and_expiry_retains_record() {
+async fn invalid_lookup_preserves_old_identity_and_expiry_reclaims_capacity() {
     let (rest, listener, directory, original) = stale_fixture().await;
     let path = directory.join(format!("{}.json", original.id));
     let server = tokio::spawn(async move {
@@ -214,9 +214,9 @@ async fn invalid_lookup_preserves_old_identity_and_expiry_retains_record() {
     persisted.next_attempt_at = 0;
     save(&path, &persisted).unwrap();
     drain(&rest, &directory, &mut None).await.unwrap();
-    let expired: PendingNotice = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(expired.expired);
-    assert_eq!(expired.event.id, original.id);
+    assert!(!path.exists());
+    enqueue_at(&directory, original).unwrap();
+    assert!(path.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

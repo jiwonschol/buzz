@@ -45,6 +45,26 @@ async fn heartbeat_usage_error_holds_account_without_a_batch() {
 }
 
 #[tokio::test]
+async fn terminal_usage_hold_saves_notice_without_extending_account_hold() {
+    let rest = pool::test_prompt_context().rest_client;
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..rest };
+    let channel = Uuid::new_v4();
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.set_usage_limit_holds_for_test(channel, u32::MAX - 1);
+    let action = run_error_outcome_with_rest(&mut queue, channel, one_event_batch(channel, "expired"), limit_error(), Some(&rest)).await;
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(!queue.is_account_held());
+    assert_eq!(queue.queued_event_count(channel), 0);
+    let path = notice_outbox::directory(&rest).unwrap();
+    let records: Vec<_> = std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let record = records.iter().find(|path| path.extension().is_some_and(|ext| ext == "json")).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    assert!(saved["event"]["content"].as_str().unwrap().contains("Please re-send"));
+    for record in records { std::fs::remove_file(record).unwrap(); }
+    std::fs::remove_dir(path).unwrap();
+}
+
+#[tokio::test]
 async fn removed_channel_usage_error_still_holds_other_work() {
     let channel = Uuid::new_v4();
     let scope = scope::SessionScope::Conversation { channel_id: channel };

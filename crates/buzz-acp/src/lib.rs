@@ -4908,7 +4908,12 @@ fn handle_prompt_result(
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
     let usage_limit = usage_limit_from_outcome(&result.outcome);
-    if let Some(limit) = &usage_limit {
+    if let Some(limit) = usage_limit.as_ref().filter(|_| {
+        result
+            .batch
+            .as_ref()
+            .is_none_or(|batch| removed_channels.contains(&batch.channel_id))
+    }) {
         queue.hold_account(limit.hold_delay(chrono::Local::now()));
     }
     let cancellation_preserved = result
@@ -5010,7 +5015,15 @@ fn handle_prompt_result(
                         "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
                         usage_limit::MAX_HOLD_SECS / 86_400
                     );
-                    spawn_failure_notice(rest_client, &dead, content);
+                    if let Some(rest) = rest_client {
+                        let saved =
+                            pool::build_failure_notice(rest, channel_id, &thread_tags, &content)
+                                .and_then(|event| notice_outbox::persist_or_retry(rest, event));
+                        if let Err(error) = saved {
+                            tracing::error!(%channel_id, %error, "terminal usage notice could not be scheduled");
+                        }
+                    }
+                    drop(dead);
                 } else if notice_pending {
                     // Tell the channel once per hold series why the agent has
                     // gone quiet, including the restart limitation.

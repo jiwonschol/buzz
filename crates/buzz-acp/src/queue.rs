@@ -731,10 +731,6 @@ impl EventQueue {
             .entry(scope.clone())
             .or_insert_with(|| now + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS));
         let deadline = (now + delay).min(window_end);
-        self.account_retry_after = Some(
-            self.account_retry_after
-                .map_or(deadline, |old| old.max(deadline)),
-        );
         let hold = {
             let count = self.usage_limit_holds.entry(scope.clone()).or_insert(0);
             *count += 1;
@@ -758,6 +754,11 @@ impl EventQueue {
             self.retry_after.remove(&scope);
             return Some(batch);
         }
+
+        self.account_retry_after = Some(
+            self.account_retry_after
+                .map_or(deadline, |old| old.max(deadline)),
+        );
 
         tracing::warn!(
             channel_id = %channel_id,

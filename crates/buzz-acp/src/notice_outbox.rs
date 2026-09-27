@@ -240,8 +240,7 @@ async fn drain_with_remove(
             Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
         })();
         match loaded {
-            Ok(notice) if !notice.expired => pending.push((path, notice)),
-            Ok(_) => {}
+            Ok(notice) => pending.push((path, notice)),
             Err(error) => {
                 tracing::error!(path = %path.display(), %error, "unreadable notice record retained")
             }
@@ -259,17 +258,16 @@ async fn drain_with_remove(
     for (path, mut notice) in pending {
         let result = async {
             let now = Timestamp::now().as_secs();
-            if notice.expired || notice.next_attempt_at > now {
+            if !notice.expired && now < notice.expires_at && notice.next_attempt_at > now {
                 return Ok::<_, anyhow::Error>(());
-            }
-            if now >= notice.expires_at {
-                notice.expired = true;
-                save(&path, &notice)?;
-                tracing::error!(path = %path.display(), "notice delivery expired; durable record retained");
-                return Ok(());
             }
             *cursor = Some(path.clone());
             attempted += 1;
+            if notice.expired || now >= notice.expires_at {
+                tracing::error!(event_id = %notice.event.id, path = %path.display(), "notice delivery expired; reclaiming record");
+                remove(&path)?;
+                return Ok(());
+            }
             match tokio::time::timeout(Duration::from_secs(10), deliver(rest, &path, &mut notice)).await {
                 Ok(Ok(true)) => {
                     remove(&path)?;
