@@ -219,6 +219,19 @@ pub struct FlushBatch {
 /// ```
 type RequestIds = HashSet<nostr::EventId>;
 
+struct NoticeOwnership {
+    generation: u64,
+    requests: RequestIds,
+}
+
+impl NoticeOwnership {
+    fn extend(&mut self, generation: u64, requests: impl IntoIterator<Item = nostr::EventId>) {
+        if self.generation == generation {
+            self.requests.extend(requests);
+        }
+    }
+}
+
 pub struct EventQueue {
     queues: HashMap<SessionScope, VecDeque<QueuedEvent>>,
     in_flight_scopes: HashSet<SessionScope>,
@@ -239,9 +252,10 @@ pub struct EventQueue {
     usage_hold_deadlines: HashMap<SessionScope, Instant>,
     /// Requests promised automatic recovery must not be evicted by fresh traffic.
     protected_events: HashMap<SessionScope, RequestIds>,
-    usage_notices_scheduled: HashMap<SessionScope, RequestIds>,
+    usage_notices_scheduled: HashMap<SessionScope, NoticeOwnership>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
+    account_hold_generation: u64,
     account_notice_retry: Option<Instant>,
     terminal_notices: Vec<(FlushBatch, String, Option<nostr::Event>)>,
     terminal_notice_retry: Option<Instant>,
@@ -291,6 +305,7 @@ impl EventQueue {
             protected_events: HashMap::new(),
             usage_notices_scheduled: HashMap::new(),
             account_retry_after: None,
+            account_hold_generation: 0,
             account_notice_retry: None,
             terminal_notices: Vec::new(),
             terminal_notice_retry: None,
@@ -399,7 +414,7 @@ impl EventQueue {
                 .or_default()
                 .insert(event_id);
             if let Some(ids) = self.usage_notices_scheduled.get_mut(&scope) {
-                ids.insert(event_id);
+                ids.extend(self.account_hold_generation, [event_id]);
             }
         }
         // Enforce the aggregate per-channel cap across all scopes so thread
@@ -788,10 +803,7 @@ impl EventQueue {
             return Some(batch);
         }
 
-        self.account_retry_after = Some(
-            self.account_retry_after
-                .map_or(deadline, |old| old.max(deadline)),
-        );
+        self.hold_account(deadline.saturating_duration_since(now));
 
         tracing::warn!(
             channel_id = %channel_id,
@@ -830,7 +842,9 @@ impl EventQueue {
     pub(crate) fn usage_notice_scheduled(&self, scope: &SessionScope) -> bool {
         self.usage_notices_scheduled
             .get(scope)
-            .is_some_and(|ids| !ids.is_empty())
+            .is_some_and(|notice| {
+                notice.generation == self.account_hold_generation && !notice.requests.is_empty()
+            })
     }
 
     pub(crate) fn mark_usage_notice_scheduled(&mut self, scope: SessionScope) {
@@ -840,10 +854,20 @@ impl EventQueue {
                 .entry(scope.clone())
                 .or_default()
                 .extend(&ids);
-            self.usage_notices_scheduled
+            let notice = self
+                .usage_notices_scheduled
                 .entry(scope)
-                .or_default()
-                .extend(ids);
+                .or_insert_with(|| NoticeOwnership {
+                    generation: self.account_hold_generation,
+                    requests: RequestIds::new(),
+                });
+            if notice.generation != self.account_hold_generation {
+                *notice = NoticeOwnership {
+                    generation: self.account_hold_generation,
+                    requests: RequestIds::new(),
+                };
+            }
+            notice.requests.extend(ids);
         }
     }
 
@@ -885,6 +909,10 @@ impl EventQueue {
     }
 
     pub(crate) fn hold_account(&mut self, delay: Duration) {
+        if !self.is_account_held() {
+            self.account_hold_generation = self.account_hold_generation.wrapping_add(1);
+            self.account_notice_retry = None;
+        }
         let deadline = Instant::now() + delay;
         self.account_retry_after = Some(
             self.account_retry_after
@@ -990,7 +1018,7 @@ impl EventQueue {
                 .or_default()
                 .extend(&ids);
             if let Some(notified) = self.usage_notices_scheduled.get_mut(&scope) {
-                notified.extend(ids);
+                notified.extend(self.account_hold_generation, ids);
             }
         }
 
@@ -1058,7 +1086,7 @@ impl EventQueue {
                 .or_default()
                 .extend(&ids);
             if let Some(notified) = self.usage_notices_scheduled.get_mut(&scope) {
-                notified.extend(ids);
+                notified.extend(self.account_hold_generation, ids);
             }
         }
         let entry = self.cancelled_batches.entry(scope.clone()).or_default();
@@ -1547,15 +1575,16 @@ impl EventQueue {
                     );
                 }
             }
-            for map in [
-                &mut self.protected_events,
-                &mut self.usage_notices_scheduled,
-            ] {
-                if let Some(ids) = map.get_mut(&scope) {
-                    ids.retain(|id| live.contains(id));
-                    if ids.is_empty() {
-                        map.remove(&scope);
-                    }
+            if let Some(ids) = self.protected_events.get_mut(&scope) {
+                ids.retain(|id| live.contains(id));
+                if ids.is_empty() {
+                    self.protected_events.remove(&scope);
+                }
+            }
+            if let Some(notice) = self.usage_notices_scheduled.get_mut(&scope) {
+                notice.requests.retain(|id| live.contains(id));
+                if notice.requests.is_empty() {
+                    self.usage_notices_scheduled.remove(&scope);
                 }
             }
         }

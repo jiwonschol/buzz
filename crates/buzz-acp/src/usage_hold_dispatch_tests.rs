@@ -195,6 +195,28 @@ async fn maintenance_preserves_account_notice_without_request_hold() {
 }
 
 #[tokio::test]
+async fn new_account_hold_does_not_inherit_previous_notice() {
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..pool::test_prompt_context().rest_client };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    queue.hold_account(Duration::from_secs(3600));
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "old hold"));
+    retry_terminal_notices(&mut queue, Some(&rest));
+    queue.expire_retry_for_test();
+    queue.flush_next().unwrap();
+    queue.hold_account(Duration::from_secs(3600));
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "new hold"));
+    assert!(!queue.usage_notice_scheduled(&scope));
+    retry_terminal_notices(&mut queue, Some(&rest));
+    assert!(queue.usage_notice_scheduled(&scope));
+    queue.hold_account(Duration::from_secs(7200));
+    assert!(queue.usage_notice_scheduled(&scope));
+    queue.finish_request(scope.clone());
+    assert!(queue.usage_notice_scheduled(&scope));
+}
+
+#[tokio::test]
 async fn successful_retry_clears_hold_with_new_input_before_timer_consumption() {
     let channel = Uuid::new_v4();
     let scope = scope::SessionScope::Conversation { channel_id: channel };
