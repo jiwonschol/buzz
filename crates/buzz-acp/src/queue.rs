@@ -239,6 +239,8 @@ pub struct EventQueue {
     usage_notices_scheduled: HashSet<SessionScope>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
+    terminal_notices: Vec<(FlushBatch, String, Option<nostr::Event>)>,
+    terminal_notice_retry: Option<Instant>,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
@@ -284,6 +286,8 @@ impl EventQueue {
             protected_events: HashMap::new(),
             usage_notices_scheduled: HashSet::new(),
             account_retry_after: None,
+            terminal_notices: Vec::new(),
+            terminal_notice_retry: None,
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
@@ -408,6 +412,12 @@ impl EventQueue {
                 .iter()
                 .filter(|(scope, _)| scope.channel_id() == channel_id)
                 .map(|(_, events)| events.len())
+                .sum::<usize>()
+            + self
+                .terminal_notices
+                .iter()
+                .filter(|(batch, _, _)| batch.channel_id == channel_id)
+                .map(|(batch, _, _)| batch.events.len() + batch.cancelled_events.len())
                 .sum::<usize>()
     }
 
@@ -602,7 +612,10 @@ impl EventQueue {
         self.release_in_flight(&scope);
         let now = Instant::now();
         match self.retry_after.get(&scope) {
-            Some(&deadline) if deadline > now => {}
+            Some(&deadline)
+                if deadline > now
+                    || self.queues.contains_key(&scope)
+                    || self.cancelled_batches.contains_key(&scope) => {}
             _ => {
                 self.usage_hold_deadlines.remove(&scope);
                 self.retry_after.remove(&scope);
@@ -825,7 +838,41 @@ impl EventQueue {
                     .chain(self.account_retry_after)
                     .max()
             })
+            .chain(self.terminal_notice_retry)
             .min()
+    }
+
+    pub(crate) fn retain_terminal_notice(
+        &mut self,
+        batch: FlushBatch,
+        content: String,
+        event: Option<nostr::Event>,
+    ) {
+        self.terminal_notices.push((batch, content, event));
+        let retry = Instant::now() + Duration::from_secs(5);
+        self.terminal_notice_retry = Some(
+            self.terminal_notice_retry
+                .map_or(retry, |old| old.min(retry)),
+        );
+    }
+
+    pub(crate) fn take_due_terminal_notices(
+        &mut self,
+    ) -> Vec<(FlushBatch, String, Option<nostr::Event>)> {
+        if self
+            .terminal_notice_retry
+            .is_some_and(|at| at <= Instant::now())
+        {
+            self.terminal_notice_retry = None;
+            std::mem::take(&mut self.terminal_notices)
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_terminal_notices_due_for_test(&mut self) {
+        self.terminal_notice_retry = Some(Instant::now());
     }
 
     /// Consume only throttle timestamps, retaining protected requests and
@@ -1100,6 +1147,11 @@ impl EventQueue {
     /// Returns the event IDs of dropped events so the caller can clean up
     /// any reactions (👀) that were added at queue-push time.
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
+        self.terminal_notices
+            .retain(|(batch, _, _)| batch.channel_id != channel_id);
+        if self.terminal_notices.is_empty() {
+            self.terminal_notice_retry = None;
+        }
         // Channel-wide cleanup must find and clear EVERY child thread scope for
         // this channel, not just the conversation scope.
         let scopes: Vec<SessionScope> = self

@@ -44,6 +44,54 @@ async fn heartbeat_usage_error_holds_account_without_a_batch() {
     assert!(pool.any_idle());
 }
 
+#[test]
+fn saturated_terminal_notice_retries_without_provider_dispatch() {
+    const CHILD: &str = "BUZZ_TERMINAL_SATURATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "error_outcome_emission_tests::saturated_terminal_notice_retries_without_provider_dispatch", "--nocapture"])
+            .env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let rest = pool::test_prompt_context().rest_client;
+        let rest = relay::RestClient { keys: nostr::Keys::generate(), ..rest };
+        let path = notice_outbox::directory(&rest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"storage unavailable").unwrap();
+        let full = notice_outbox::saturate_retries_for_test();
+        let channel = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut batch = one_event_batch(channel, "terminal");
+        for _ in 0..499 { batch.cancelled_events.extend(one_event_batch(channel, "earlier").events); }
+        save_terminal_notice(&mut queue, Some(&rest), batch, "terminal notice".into());
+        assert!(queue.next_retry_deadline().is_some());
+        assert!(queue.flush_next().is_none());
+        assert!(!queue.push(QueuedEvent {
+            channel_id: channel,
+            scope: scope::SessionScope::Conversation { channel_id: channel },
+            event: one_event_batch(channel, "new").events.pop().unwrap().event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+        queue.make_terminal_notices_due_for_test();
+        retry_terminal_notices(&mut queue, Some(&rest));
+        assert!(queue.next_retry_deadline().is_some());
+        std::fs::remove_file(&path).unwrap();
+        drop(full);
+        queue.make_terminal_notices_due_for_test();
+        retry_terminal_notices(&mut queue, Some(&rest));
+        assert!(queue.next_retry_deadline().is_none());
+        assert!(queue.flush_next().is_none());
+        let files: Vec<_> = std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(files.iter().filter(|path| path.extension().is_some_and(|ext| ext == "json")).count(), 1);
+        for file in files { std::fs::remove_file(file).unwrap(); }
+        std::fs::remove_dir(path).unwrap();
+    });
+}
+
 #[tokio::test]
 async fn terminal_usage_hold_saves_notice_without_extending_account_hold() {
     let rest = pool::test_prompt_context().rest_client;

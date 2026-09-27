@@ -351,12 +351,11 @@ fn test_requeue_held_dead_letters_past_the_hold_cap() {
     // Hold number MAX is still a hold …
     let batch = queue.flush_next().expect("batch");
     assert!(queue
-        .requeue_held(batch, Duration::from_millis(1))
+        .requeue_held(batch, Duration::ZERO)
         .is_none());
     queue.mark_complete(channel_id);
     assert_eq!(queue.usage_limit_holds(channel_id), MAX_USAGE_LIMIT_HOLDS);
     assert_eq!(queue.retry_count_for_test(channel_id), 0);
-    std::thread::sleep(Duration::from_millis(5));
 
     // … and the next one dead-letters.
     let batch = queue.flush_next().expect("batch after hold");

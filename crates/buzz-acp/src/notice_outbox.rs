@@ -16,6 +16,13 @@ const MAX_RECORDS: usize = 1024;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 static PERSIST_RETRIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_RECORDS);
 
+#[cfg(test)]
+pub(crate) fn saturate_retries_for_test() -> tokio::sync::SemaphorePermit<'static> {
+    PERSIST_RETRIES
+        .try_acquire_many(MAX_RECORDS as u32)
+        .unwrap()
+}
+
 #[derive(Serialize, Deserialize)]
 struct PendingNotice {
     event: Event,

@@ -3065,6 +3065,7 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        retry_terminal_notices(&mut queue, Some(&ctx.rest_client));
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -4728,14 +4729,53 @@ fn usage_limit_from_outcome(outcome: &PromptOutcome) -> Option<usage_limit::Usag
 const NOTICE_EXCERPT_CHARS: usize = 80;
 const NOTICE_DETAIL_EVENTS: usize = 10;
 
-/// Describe the events of a failed batch for a channel notice: which agent
-/// and turn they belonged to, and one `buzz://message` deep link per event
-/// with its author, time and an excerpt of what was asked.
-///
-/// A bare "please re-send" leaves the reader guessing *what* was lost —
-/// during a fleet-wide usage-limit outage a dozen agents each drop a different
-/// request into the same channel. The deep link resolves the original event
-/// in Buzz Desktop even when the notice cannot be threaded under it.
+fn retry_terminal_notices(queue: &mut EventQueue, rest: Option<&relay::RestClient>) {
+    for (batch, content, event) in queue.take_due_terminal_notices() {
+        save_terminal_notice_event(queue, rest, batch, content, event);
+    }
+}
+
+fn save_terminal_notice(
+    queue: &mut EventQueue,
+    rest: Option<&relay::RestClient>,
+    batch: FlushBatch,
+    content: String,
+) {
+    save_terminal_notice_event(queue, rest, batch, content, None);
+}
+
+fn save_terminal_notice_event(
+    queue: &mut EventQueue,
+    rest: Option<&relay::RestClient>,
+    batch: FlushBatch,
+    content: String,
+    mut event: Option<nostr::Event>,
+) {
+    let saved = rest
+        .context("terminal notice transport unavailable")
+        .and_then(|rest| {
+            let tags = batch
+                .events
+                .last()
+                .map(|event| queue::parse_thread_tags(&event.event))
+                .unwrap_or_default();
+            if event.is_none() {
+                event = Some(pool::build_failure_notice(
+                    rest,
+                    batch.channel_id,
+                    &tags,
+                    &content,
+                )?);
+            }
+            notice_outbox::persist_or_retry(rest, event.as_ref().expect("notice built").clone())
+        });
+    if let Err(error) = saved {
+        tracing::error!(channel_id = %batch.channel_id, %error, "retaining terminal request until notice can be scheduled");
+        queue.retain_terminal_notice(batch, content, event);
+    }
+}
+
+/// Describe affected requests with bounded excerpts and navigable event links.
 fn describe_batch_events(batch: &FlushBatch, turn_id: &str, config: &Config) -> String {
     let affected_count = batch.cancelled_events.len() + batch.events.len();
     let turn_id = notice_excerpt(turn_id);
@@ -5015,15 +5055,7 @@ fn handle_prompt_result(
                         "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
                         usage_limit::MAX_HOLD_SECS / 86_400
                     );
-                    if let Some(rest) = rest_client {
-                        let saved =
-                            pool::build_failure_notice(rest, channel_id, &thread_tags, &content)
-                                .and_then(|event| notice_outbox::persist_or_retry(rest, event));
-                        if let Err(error) = saved {
-                            tracing::error!(%channel_id, %error, "terminal usage notice could not be scheduled");
-                        }
-                    }
-                    drop(dead);
+                    save_terminal_notice(queue, rest_client, dead, content);
                 } else if notice_pending {
                     // Tell the channel once per hold series why the agent has
                     // gone quiet, including the restart limitation.
