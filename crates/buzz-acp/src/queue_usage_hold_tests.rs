@@ -1,6 +1,67 @@
 // ── usage-limit hold ──────────────────────────────────────────────────
 
 #[test]
+fn account_admission_does_not_restart_absolute_hold_window() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    q.hold_account(Duration::from_secs(3600));
+    let mut event = make_queued(channel, "aged admission");
+    event.received_at = Instant::now() - Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS + 1);
+    q.push(event);
+    q.expire_retry_for_test();
+    let batch = q.flush_next().unwrap();
+    assert!(q.requeue_held(batch, Duration::from_secs(3600)).is_some());
+}
+
+#[test]
+fn mixed_hold_batch_expires_only_old_requests_including_cancelled() {
+    for cancelled in [false, true] {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        q.hold_account(Duration::from_secs(3600));
+        let mut old = make_queued(channel, "old");
+        old.received_at = Instant::now() - Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS + 1);
+        let old_id = old.event.id;
+        q.push(old);
+        let fresh = make_queued(channel, "fresh");
+        let fresh_id = fresh.event.id;
+        q.push(fresh);
+        q.expire_retry_for_test();
+        let mut batch = q.flush_next().unwrap();
+        if cancelled {
+            batch.cancelled_events.push(batch.events.remove(0));
+            batch.cancel_reason = Some(CancelReason::Steer);
+        }
+        let (dead, retained) = q.requeue_held_partitioned(batch, Duration::from_secs(3600));
+        assert!(retained);
+        let dead = dead.unwrap();
+        assert_eq!(dead.events.iter().chain(&dead.cancelled_events).map(|e| e.event.id).collect::<Vec<_>>(), vec![old_id]);
+        q.release_in_flight(channel);
+        q.compact_expired_state();
+        assert!(q.usage_hold_deadlines[&conv(channel)].contains_key(&fresh_id));
+        q.expire_retry_for_test();
+        let next = q.flush_next().unwrap();
+        assert_eq!(next.events[0].event.id, fresh_id);
+        assert!(q.requeue_held(next, Duration::from_secs(3600)).is_none());
+    }
+}
+
+#[test]
+fn terminal_retry_pass_has_a_work_limit() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    for _ in 0..33 {
+        let channel = Uuid::new_v4();
+        q.push(make_queued(channel, "terminal"));
+        let batch = q.flush_next().unwrap();
+        q.release_in_flight(conv(channel));
+        q.retain_terminal_notice(batch, "terminal".into(), None);
+    }
+    q.make_terminal_notices_due_for_test();
+    assert!(q.take_due_terminal_notices().len() <= 32);
+    assert!(q.has_undispatched_work());
+}
+
+#[test]
 fn maintenance_preserves_due_retry_wake_until_consumed() {
     let mut q = EventQueue::new(DedupMode::Queue);
     let channel = Uuid::new_v4();
@@ -171,14 +232,14 @@ fn usage_window_is_absolute_for_every_delay() {
         q.requeue_held(batch, Duration::from_secs(delay));
         q.mark_complete(channel);
         let end = Instant::now() + Duration::from_secs(1);
-        q.usage_hold_deadlines.insert(conv(channel), end);
+        q.usage_hold_deadlines.get_mut(&conv(channel)).unwrap().values_mut().for_each(|deadline| *deadline = end);
         q.retry_after.clear();
         q.account_retry_after = None;
         let batch = q.flush_next().unwrap();
         assert!(q.requeue_held(batch, Duration::from_secs(delay)).is_none());
         assert_eq!(q.retry_after[&conv(channel)], end);
         q.mark_complete(channel);
-        q.usage_hold_deadlines.insert(conv(channel), Instant::now());
+        q.usage_hold_deadlines.get_mut(&conv(channel)).unwrap().values_mut().for_each(|deadline| *deadline = Instant::now());
         q.retry_after.clear();
         q.account_retry_after = None;
         let batch = q.flush_next().unwrap();
@@ -379,8 +440,8 @@ fn test_requeue_held_releases_the_same_events_after_the_delay() {
 fn test_requeue_held_dead_letters_past_the_hold_cap() {
     let mut queue = EventQueue::new(DedupMode::Queue);
     let channel_id = Uuid::new_v4();
-    queue.set_usage_limit_holds_for_test(channel_id, MAX_USAGE_LIMIT_HOLDS - 1);
     queue.push(make_queued(channel_id, "doomed"));
+    queue.set_usage_limit_holds_for_test(channel_id, MAX_USAGE_LIMIT_HOLDS - 1);
 
     // Hold number MAX is still a hold …
     let batch = queue.flush_next().expect("batch");

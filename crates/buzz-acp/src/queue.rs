@@ -224,6 +224,14 @@ struct NoticeOwnership {
     requests: RequestIds,
 }
 
+pub(crate) struct TerminalNotice {
+    pub batch: FlushBatch,
+    pub content: String,
+    pub event: Option<nostr::Event>,
+    pub backoff: Duration,
+    next_attempt: Instant,
+}
+
 impl NoticeOwnership {
     fn extend(&mut self, generation: u64, requests: impl IntoIterator<Item = nostr::EventId>) {
         if self.generation == generation {
@@ -243,13 +251,13 @@ pub struct EventQueue {
     retry_after: HashMap<SessionScope, Instant>,
     /// Per-scope retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<SessionScope, u32>,
-    /// Per-scope count of consecutive usage-limit holds (see
-    /// [`requeue_held`](Self::requeue_held)); dead-letter after
+    /// Per-request count of consecutive usage-limit holds (see
+    /// `requeue_held_partitioned`); dead-letter after
     /// [`MAX_USAGE_LIMIT_HOLDS`]. Kept apart from `retry_counts` so a hold
     /// never eats into the transient-failure budget.
-    usage_limit_holds: HashMap<SessionScope, u32>,
-    /// Absolute retry-window end, retained across worker contention and retries.
-    usage_hold_deadlines: HashMap<SessionScope, Instant>,
+    usage_limit_holds: HashMap<SessionScope, HashMap<nostr::EventId, u32>>,
+    /// Per-request absolute window, retained across contention and retries.
+    usage_hold_deadlines: HashMap<SessionScope, HashMap<nostr::EventId, Instant>>,
     /// Requests promised automatic recovery must not be evicted by fresh traffic.
     protected_events: HashMap<SessionScope, RequestIds>,
     usage_notices_scheduled: HashMap<SessionScope, NoticeOwnership>,
@@ -257,8 +265,7 @@ pub struct EventQueue {
     account_retry_after: Option<Instant>,
     account_hold_generation: u64,
     account_notice_retry: Option<Instant>,
-    terminal_notices: Vec<(FlushBatch, String, Option<nostr::Event>)>,
-    terminal_notice_retry: Option<Instant>,
+    terminal_notices: Vec<TerminalNotice>,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
@@ -308,7 +315,6 @@ impl EventQueue {
             account_hold_generation: 0,
             account_notice_retry: None,
             terminal_notices: Vec::new(),
-            terminal_notice_retry: None,
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
@@ -387,6 +393,7 @@ impl EventQueue {
         }
         let scope = event.scope.clone();
         let event_id = event.event.id;
+        let received_at = event.received_at;
         let account_held = self.is_account_held();
         let queue = self.queues.entry(scope.clone()).or_default();
         // Enforce per-scope depth cap: drop oldest in this partition.
@@ -409,6 +416,11 @@ impl EventQueue {
         }
         queue.push_back(event);
         if account_held {
+            self.usage_hold_deadlines
+                .entry(scope.clone())
+                .or_default()
+                .entry(event_id)
+                .or_insert(received_at + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS));
             self.protected_events
                 .entry(scope.clone())
                 .or_default()
@@ -447,8 +459,8 @@ impl EventQueue {
             + self
                 .terminal_notices
                 .iter()
-                .filter(|(batch, _, _)| batch.channel_id == channel_id)
-                .map(|(batch, _, _)| batch.events.len() + batch.cancelled_events.len())
+                .filter(|notice| notice.batch.channel_id == channel_id)
+                .map(|notice| notice.batch.events.len() + notice.batch.cancelled_events.len())
                 .sum::<usize>()
     }
 
@@ -673,10 +685,8 @@ impl EventQueue {
     /// Requeued requests must use `release_in_flight` instead.
     pub(crate) fn finish_request(&mut self, scope: SessionScope) {
         self.release_in_flight(&scope);
-        self.usage_hold_deadlines.remove(&scope);
         self.retry_after.remove(&scope);
         self.retry_counts.remove(&scope);
-        self.usage_limit_holds.remove(&scope);
         self.compact_request_ownership();
     }
 
@@ -716,8 +726,6 @@ impl EventQueue {
                 batch.events.len(),
             );
             self.retry_counts.remove(&scope);
-            self.usage_limit_holds.remove(&scope);
-            self.usage_hold_deadlines.remove(&scope);
             // Also clear retry_after so fresh traffic on this scope isn't
             // throttled by stale backoff from the discarded poison batch.
             self.retry_after.remove(&scope);
@@ -772,43 +780,74 @@ impl EventQueue {
     /// Note: does NOT remove from `in_flight_scopes` — caller must call
     /// `mark_complete` separately (which keeps both counters while the hold
     /// is active, exactly as for a backoff requeue).
+    #[cfg(test)]
     pub fn requeue_held(&mut self, batch: FlushBatch, delay: Duration) -> Option<FlushBatch> {
+        self.requeue_held_partitioned(batch, delay).0
+    }
+
+    pub(crate) fn requeue_held_partitioned(
+        &mut self,
+        mut batch: FlushBatch,
+        delay: Duration,
+    ) -> (Option<FlushBatch>, bool) {
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
         let now = Instant::now();
-        let window_end = *self
-            .usage_hold_deadlines
-            .entry(scope.clone())
-            .or_insert_with(|| now + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS));
-        let deadline = (now + delay).min(window_end);
-        let hold = {
-            let count = self.usage_limit_holds.entry(scope.clone()).or_insert(0);
-            *count += 1;
-            *count
-        };
-
-        if now >= window_end || hold > MAX_USAGE_LIMIT_HOLDS {
-            tracing::error!(
-                channel_id = %channel_id,
-                hold,
-                events = batch.events.len(),
-                "dead-lettering batch after {} usage-limit holds — discarding {} events",
-                MAX_USAGE_LIMIT_HOLDS,
-                batch.events.len(),
-            );
-            self.usage_limit_holds.remove(&scope);
-            self.usage_hold_deadlines.remove(&scope);
-            self.retry_counts.remove(&scope);
-            self.retry_after.remove(&scope);
-            return Some(batch);
+        let windows = self.usage_hold_deadlines.entry(scope.clone()).or_default();
+        let counts = self.usage_limit_holds.entry(scope.clone()).or_default();
+        for event in batch.events.iter().chain(&batch.cancelled_events) {
+            windows
+                .entry(event.event.id)
+                .or_insert(now + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS));
+            let count = counts.entry(event.event.id).or_default();
+            *count = count.saturating_add(1);
         }
+        let (expired_events, events): (Vec<_>, Vec<_>) =
+            batch.events.into_iter().partition(|event| {
+                windows[&event.event.id] <= now || counts[&event.event.id] > MAX_USAGE_LIMIT_HOLDS
+            });
+        let (expired_cancelled, cancelled): (Vec<_>, Vec<_>) =
+            batch.cancelled_events.into_iter().partition(|event| {
+                windows[&event.event.id] <= now || counts[&event.event.id] > MAX_USAGE_LIMIT_HOLDS
+            });
+        let expired = if expired_events.is_empty() && expired_cancelled.is_empty() {
+            None
+        } else {
+            Some(FlushBatch {
+                channel_id,
+                scope: scope.clone(),
+                events: expired_events,
+                cancelled_events: expired_cancelled,
+                cancel_reason: batch.cancel_reason,
+            })
+        };
+        batch.events = events;
+        batch.cancelled_events = cancelled;
+        if let Some(dead) = &expired {
+            for event in dead.events.iter().chain(&dead.cancelled_events) {
+                windows.remove(&event.event.id);
+                counts.remove(&event.event.id);
+            }
+            tracing::error!(%channel_id, events = dead.events.len() + dead.cancelled_events.len(), "usage-limit request window exhausted; retaining terminal notice ownership");
+        }
+        if batch.events.is_empty() && batch.cancelled_events.is_empty() {
+            self.retry_after.remove(&scope);
+            return (expired, false);
+        }
+        let window_end = batch
+            .events
+            .iter()
+            .chain(&batch.cancelled_events)
+            .map(|event| windows[&event.event.id])
+            .min()
+            .unwrap_or(now);
+        let deadline = (now + delay).min(window_end);
 
         self.hold_account(deadline.saturating_duration_since(now));
 
         tracing::warn!(
             channel_id = %channel_id,
             scope = %scope.telemetry_label(),
-            hold,
             max = MAX_USAGE_LIMIT_HOLDS,
             delay_secs = delay.as_secs(),
             events = batch.events.len(),
@@ -826,7 +865,7 @@ impl EventQueue {
             );
         self.requeue_preserve_timestamps(batch);
         self.retry_after.insert(scope, deadline);
-        None
+        (expired, true)
     }
 
     /// Number of consecutive usage-limit holds recorded for `scope` since its
@@ -835,7 +874,7 @@ impl EventQueue {
     pub fn usage_limit_holds<K: IntoScope>(&self, scope: K) -> u32 {
         self.usage_limit_holds
             .get(&scope.into_scope())
-            .copied()
+            .and_then(|counts| counts.values().copied().max())
             .unwrap_or(0)
     }
 
@@ -935,42 +974,61 @@ impl EventQueue {
                     .chain(self.account_retry_after)
                     .max()
             })
-            .chain(self.terminal_notice_retry)
+            .chain(
+                self.terminal_notices
+                    .iter()
+                    .map(|notice| notice.next_attempt),
+            )
             .chain(self.account_notice_retry)
             .min()
     }
 
+    #[cfg(test)]
     pub(crate) fn retain_terminal_notice(
         &mut self,
         batch: FlushBatch,
         content: String,
         event: Option<nostr::Event>,
     ) {
-        self.terminal_notices.push((batch, content, event));
-        let retry = Instant::now() + Duration::from_secs(5);
-        self.terminal_notice_retry = Some(
-            self.terminal_notice_retry
-                .map_or(retry, |old| old.min(retry)),
-        );
+        self.retain_terminal_notice_after(batch, content, event, Duration::from_secs(5));
     }
 
-    pub(crate) fn take_due_terminal_notices(
+    pub(crate) fn retain_terminal_notice_after(
         &mut self,
-    ) -> Vec<(FlushBatch, String, Option<nostr::Event>)> {
-        if self
-            .terminal_notice_retry
-            .is_some_and(|at| at <= Instant::now())
-        {
-            self.terminal_notice_retry = None;
-            std::mem::take(&mut self.terminal_notices)
-        } else {
-            Vec::new()
+        batch: FlushBatch,
+        content: String,
+        event: Option<nostr::Event>,
+        backoff: Duration,
+    ) {
+        self.terminal_notices.push(TerminalNotice {
+            batch,
+            content,
+            event,
+            backoff,
+            next_attempt: Instant::now() + backoff,
+        });
+    }
+
+    pub(crate) fn take_due_terminal_notices(&mut self) -> Vec<TerminalNotice> {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        let mut waiting = Vec::new();
+        for notice in self.terminal_notices.drain(..) {
+            if due.len() < 32 && notice.next_attempt <= now {
+                due.push(notice);
+            } else {
+                waiting.push(notice);
+            }
         }
+        self.terminal_notices = waiting;
+        due
     }
 
     #[cfg(test)]
     pub(crate) fn make_terminal_notices_due_for_test(&mut self) {
-        self.terminal_notice_retry = Some(Instant::now());
+        for notice in &mut self.terminal_notices {
+            notice.next_attempt = Instant::now();
+        }
     }
 
     /// Consume only throttle timestamps, retaining protected requests and
@@ -1007,6 +1065,12 @@ impl EventQueue {
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
         if self.is_account_held() {
+            let windows = self.usage_hold_deadlines.entry(scope.clone()).or_default();
+            for event in batch.events.iter().chain(&batch.cancelled_events) {
+                windows.entry(event.event.id).or_insert_with(|| {
+                    Instant::now() + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS)
+                });
+            }
             let ids: RequestIds = batch
                 .events
                 .iter()
@@ -1075,6 +1139,12 @@ impl EventQueue {
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
         let scope = batch.scope.clone();
         if self.is_account_held() {
+            let windows = self.usage_hold_deadlines.entry(scope.clone()).or_default();
+            for event in batch.events.iter().chain(&batch.cancelled_events) {
+                windows.entry(event.event.id).or_insert_with(|| {
+                    Instant::now() + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS)
+                });
+            }
             let ids: RequestIds = batch
                 .events
                 .iter()
@@ -1238,7 +1308,11 @@ impl EventQueue {
     /// holds so a test can hit [`MAX_USAGE_LIMIT_HOLDS`] directly. Test-only.
     #[cfg(test)]
     pub fn set_usage_limit_holds_for_test<K: IntoScope>(&mut self, scope: K, count: u32) {
-        self.usage_limit_holds.insert(scope.into_scope(), count);
+        let scope = scope.into_scope();
+        let mut ids = self.pending_request_ids(&scope);
+        ids.extend(self.in_flight_request_ids.get(&scope).into_iter().flatten());
+        self.usage_limit_holds
+            .insert(scope, ids.into_iter().map(|id| (id, count)).collect());
     }
 
     /// Remaining `retry_after` throttle for a scope, if one is set. Test-only.
@@ -1278,10 +1352,7 @@ impl EventQueue {
     /// any reactions (👀) that were added at queue-push time.
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
         self.terminal_notices
-            .retain(|(batch, _, _)| batch.channel_id != channel_id);
-        if self.terminal_notices.is_empty() {
-            self.terminal_notice_retry = None;
-        }
+            .retain(|notice| notice.batch.channel_id != channel_id);
         // Channel-wide cleanup must find and clear EVERY child thread scope for
         // this channel, not just the conversation scope.
         let scopes: Vec<SessionScope> = self
@@ -1519,15 +1590,8 @@ impl EventQueue {
                 || self.cancelled_batches.contains_key(scope)
                 || self.in_flight_scopes.contains(scope)
         });
-        // Same idleness rule for usage-limit hold counters.
-        self.usage_limit_holds.retain(|scope, _| {
-            self.retry_after.contains_key(scope)
-                || self.queues.get(scope).is_some_and(|q| !q.is_empty())
-                || self.cancelled_batches.contains_key(scope)
-                || self.in_flight_scopes.contains(scope)
-        });
-        self.usage_hold_deadlines
-            .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
+        // Usage counters and windows follow request ownership, including
+        // cancelled and withheld input, rather than scope timer lifetime.
         self.compact_request_ownership();
     }
 
@@ -1559,12 +1623,15 @@ impl EventQueue {
             .protected_events
             .keys()
             .chain(self.usage_notices_scheduled.keys())
+            .chain(self.usage_hold_deadlines.keys())
+            .chain(self.usage_limit_holds.keys())
             .cloned()
             .collect();
         for scope in scopes {
             let mut live = self.pending_request_ids(&scope);
             live.extend(self.in_flight_request_ids.get(&scope).into_iter().flatten());
-            for (batch, _, _) in &self.terminal_notices {
+            for notice in &self.terminal_notices {
+                let batch = &notice.batch;
                 if batch.scope == scope {
                     live.extend(
                         batch
@@ -1579,6 +1646,18 @@ impl EventQueue {
                 ids.retain(|id| live.contains(id));
                 if ids.is_empty() {
                     self.protected_events.remove(&scope);
+                }
+            }
+            if let Some(windows) = self.usage_hold_deadlines.get_mut(&scope) {
+                windows.retain(|id, _| live.contains(id));
+                if windows.is_empty() {
+                    self.usage_hold_deadlines.remove(&scope);
+                }
+            }
+            if let Some(counts) = self.usage_limit_holds.get_mut(&scope) {
+                counts.retain(|id, _| live.contains(id));
+                if counts.is_empty() {
+                    self.usage_limit_holds.remove(&scope);
                 }
             }
             if let Some(notice) = self.usage_notices_scheduled.get_mut(&scope) {

@@ -1,6 +1,26 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn existing_notice_requires_directory_sync_after_failed_commit() {
+    let rest = crate::pool::test_prompt_context().rest_client;
+    let event = crate::pool::build_failure_notice(
+        &rest,
+        uuid::Uuid::new_v4(),
+        &crate::queue::ThreadTags::default(),
+        "terminal",
+    )
+    .unwrap();
+    let directory = std::env::temp_dir().join(format!("buzz-sync-{}", uuid::Uuid::new_v4()));
+    let notice = pending(event);
+    let fail_sync = |_: &Path| anyhow::bail!("injected directory sync failure");
+    assert!(enqueue_pending_with_sync(&directory, &notice, fail_sync).is_err());
+    assert!(directory.join(format!("{}.json", notice.event.id)).exists());
+    assert!(enqueue_pending_with_sync(&directory, &notice, fail_sync).is_err());
+    enqueue_pending(&directory, &notice).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn notice_retries_the_same_signed_event_after_relay_failure() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

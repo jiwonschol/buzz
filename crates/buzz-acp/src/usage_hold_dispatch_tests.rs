@@ -114,6 +114,7 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         queue.make_terminal_notices_due_for_test();
         retry_terminal_notices(&mut queue, Some(&rest));
         assert!(queue.next_retry_deadline().is_some());
+        assert!(queue.next_retry_deadline().unwrap() > std::time::Instant::now() + Duration::from_secs(9));
         drop(full);
         // A free memory retry slot is not a durable write. Keep ownership and
         // prevent inactivity shutdown until the actual storage recovers.
@@ -121,6 +122,7 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         retry_terminal_notices(&mut queue, Some(&rest));
         assert!(queue.next_retry_deadline().is_some());
         assert!(queue.has_undispatched_work());
+        assert!(queue.next_retry_deadline().unwrap() > std::time::Instant::now() + Duration::from_secs(19));
         let idle_start = tokio::time::Instant::now();
         let idle_end = idle_start + Duration::from_secs(61);
         assert!(!inactivity_exit_due(idle_start, idle_end, Duration::from_secs(60), &queue, false));
@@ -238,8 +240,10 @@ async fn terminal_usage_hold_saves_notice_without_extending_account_hold() {
     let rest = relay::RestClient { keys: nostr::Keys::generate(), ..rest };
     let channel = Uuid::new_v4();
     let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "expired"));
+    let batch = queue.flush_next().unwrap();
     queue.set_usage_limit_holds_for_test(channel, u32::MAX - 1);
-    let action = run_error_outcome_with_rest(&mut queue, channel, one_event_batch(channel, "expired"), limit_error(), Some(&rest)).await;
+    let action = run_error_outcome_with_rest(&mut queue, channel, batch, limit_error(), Some(&rest)).await;
     assert!(matches!(action, LoopAction::Continue));
     assert!(!queue.is_account_held());
     assert_eq!(queue.queued_event_count(channel), 0);

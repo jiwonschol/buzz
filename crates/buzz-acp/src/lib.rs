@@ -4730,8 +4730,15 @@ const NOTICE_EXCERPT_CHARS: usize = 80;
 const NOTICE_DETAIL_EVENTS: usize = 10;
 
 fn retry_terminal_notices(queue: &mut EventQueue, rest: Option<&relay::RestClient>) {
-    for (batch, content, event) in queue.take_due_terminal_notices() {
-        save_terminal_notice_event(queue, rest, batch, content, event);
+    for notice in queue.take_due_terminal_notices() {
+        save_terminal_notice_event(
+            queue,
+            rest,
+            notice.batch,
+            notice.content,
+            notice.event,
+            (notice.backoff * 2).min(Duration::from_secs(300)),
+        );
     }
     for pending in queue.account_notice_candidates() {
         let content = format!(
@@ -4762,7 +4769,7 @@ fn save_terminal_notice(
     batch: FlushBatch,
     content: String,
 ) {
-    save_terminal_notice_event(queue, rest, batch, content, None);
+    save_terminal_notice_event(queue, rest, batch, content, None, Duration::from_secs(5));
 }
 
 fn save_terminal_notice_event(
@@ -4771,6 +4778,7 @@ fn save_terminal_notice_event(
     batch: FlushBatch,
     content: String,
     mut event: Option<nostr::Event>,
+    backoff: Duration,
 ) {
     let saved = rest
         .context("terminal notice transport unavailable")
@@ -4798,7 +4806,7 @@ fn save_terminal_notice_event(
         });
     if let Err(error) = saved {
         tracing::error!(channel_id = %batch.channel_id, %error, "retaining terminal request until notice is stored");
-        queue.retain_terminal_notice(batch, content, event);
+        queue.retain_terminal_notice_after(batch, content, event, backoff);
     }
 }
 
@@ -5073,9 +5081,10 @@ fn handle_prompt_result(
                     .unwrap_or_default();
                 let notice_scope = batch.scope.clone();
                 let notice_pending = !queue.usage_notice_scheduled(&notice_scope);
-                let dead = queue.requeue_held(batch, delay);
-                batch_requeued = dead.is_none();
+                let (dead, retained) = queue.requeue_held_partitioned(batch, delay);
+                batch_requeued = retained;
                 if let Some(dead) = dead {
+                    let details = describe_batch_events(&dead, &result.turn_id, config);
                     let content = format!(
                         "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
                         usage_limit::MAX_HOLD_SECS / 86_400
@@ -11541,15 +11550,11 @@ mod error_outcome_emission_tests {
     async fn usage_limit_holds_past_the_cap_dead_letter() {
         let channel_id = uuid::Uuid::new_v4();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        queue.requeue_preserve_timestamps(one_event_batch(channel_id, "x"));
+        let batch = queue.flush_next().unwrap();
         queue.set_usage_limit_holds_for_test(channel_id, queue::MAX_USAGE_LIMIT_HOLDS);
 
-        run_error_outcome(
-            &mut queue,
-            channel_id,
-            one_event_batch(channel_id, "x"),
-            limit_error(),
-        )
-        .await;
+        run_error_outcome(&mut queue, channel_id, batch, limit_error()).await;
 
         assert_eq!(queue.queued_event_count(channel_id), 0);
         assert_eq!(queue.pending_channels(), 0);

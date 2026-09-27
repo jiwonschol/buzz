@@ -40,6 +40,22 @@ pub(super) fn directory(rest: &RestClient) -> Result<PathBuf> {
 }
 
 fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
+    save_with_sync(path, notice, sync_directory)
+}
+
+fn sync_directory(directory: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
+}
+
+fn save_with_sync(
+    path: &Path,
+    notice: &PendingNotice,
+    sync: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = path.parent().context("notice path has no parent")?;
     std::fs::create_dir_all(parent)?;
     // A persistent OS lock is released on process exit. Never unlink it: all
@@ -92,9 +108,7 @@ fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
         }
         return Err(error.into());
     }
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    sync(parent)
 }
 
 fn pending(event: Event) -> PendingNotice {
@@ -114,12 +128,22 @@ fn enqueue_at(directory: &Path, event: Event) -> Result<()> {
 }
 
 fn enqueue_pending(directory: &Path, notice: &PendingNotice) -> Result<()> {
+    enqueue_pending_with_sync(directory, notice, sync_directory)
+}
+
+fn enqueue_pending_with_sync(
+    directory: &Path,
+    notice: &PendingNotice,
+    sync: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
     std::fs::create_dir_all(directory)?;
     let path = directory.join(format!("{}.json", notice.event.id));
     if path.exists() {
-        return Ok(());
+        // A prior rename can have succeeded before directory fsync failed.
+        // Existence alone does not transfer durable ownership to the outbox.
+        return sync(directory);
     }
-    save(&path, notice)
+    save_with_sync(&path, notice, sync)
 }
 
 /// Save synchronously, or reserve a bounded background persistence retry.
