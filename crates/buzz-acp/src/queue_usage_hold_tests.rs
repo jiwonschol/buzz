@@ -1,6 +1,41 @@
 // ── usage-limit hold ──────────────────────────────────────────────────
 
 #[test]
+fn request_expiry_wakes_before_another_scopes_account_hold() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    q.hold_account(Duration::from_secs(86400));
+    let mut old = make_queued(channel, "expired");
+    old.received_at = Instant::now() - Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS + 1);
+    q.push(old);
+    assert!(q.next_retry_deadline().is_some_and(|at| at <= Instant::now()));
+    let fresh = make_queued(channel, "fresh");
+    let fresh_id = fresh.event.id;
+    q.push(fresh);
+    let expired = q.take_expired_requests();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].events.len(), 1);
+    assert_eq!(q.queued_event_ids_for_test(channel), vec![fresh_id]);
+    assert!(q.is_account_held());
+    assert!(q.flush_next().is_none());
+}
+
+#[test]
+fn expiry_batches_leave_a_wakeup_for_remaining_scopes() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    q.hold_account(Duration::from_secs(86400));
+    for _ in 0..33 {
+        let mut event = make_queued(Uuid::new_v4(), "expired");
+        event.received_at = Instant::now() - Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS + 1);
+        q.push(event);
+    }
+    assert_eq!(q.take_expired_requests().len(), 32);
+    assert!(q.request_expiry_deadline().is_some_and(|at| at <= Instant::now()));
+    assert_eq!(q.take_expired_requests().len(), 1);
+    assert!(q.request_expiry_deadline().is_none());
+}
+
+#[test]
 fn account_admission_does_not_restart_absolute_hold_window() {
     let mut q = EventQueue::new(DedupMode::Queue);
     let channel = Uuid::new_v4();

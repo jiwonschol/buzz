@@ -95,6 +95,10 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         account_queue.requeue_preserve_timestamps(one_event_batch(account_channel, "account hold"));
         retry_terminal_notices(&mut account_queue, Some(&rest));
         assert!(!account_queue.usage_notice_scheduled(&account_scope));
+        let notice_id = account_queue.usage_notice_draft(&account_scope).unwrap().id;
+        account_queue.make_account_notice_due_for_test();
+        retry_terminal_notices(&mut account_queue, Some(&rest));
+        assert_eq!(account_queue.usage_notice_draft(&account_scope).unwrap().id, notice_id);
         assert!(account_queue.next_retry_deadline().unwrap() <= std::time::Instant::now() + Duration::from_secs(5));
         assert_eq!(account_queue.queued_event_count(account_channel), 1);
         let channel = Uuid::new_v4();
@@ -235,6 +239,29 @@ async fn successful_retry_clears_hold_with_new_input_before_timer_consumption() 
 }
 
 #[tokio::test]
+async fn cancelled_only_terminal_notice_keeps_original_thread() {
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..pool::test_prompt_context().rest_client };
+    let channel = Uuid::new_v4();
+    let root = nostr::EventId::all_zeros().to_hex();
+    let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "expired thread request")
+        .tags([nostr::Tag::parse(["e", root.as_str(), "", "reply"]).unwrap()])
+        .sign_with_keys(&nostr::Keys::generate()).unwrap();
+    let mut batch = one_event_batch(channel, "unused");
+    batch.events.clear();
+    batch.cancelled_events.push(BatchEvent { event, prompt_tag: "test".into(), received_at: std::time::Instant::now() });
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    save_terminal_notice(&mut queue, Some(&rest), batch, "expired".into());
+    let path = notice_outbox::directory(&rest).unwrap();
+    let records: Vec<_> = std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let record = records.iter().find(|path| path.extension().is_some_and(|ext| ext == "json")).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    let event: nostr::Event = serde_json::from_value(saved["event"].clone()).unwrap();
+    assert_eq!(queue::parse_thread_tags(&event).root_event_id, Some(root));
+    for record in records { std::fs::remove_file(record).unwrap(); }
+    std::fs::remove_dir(path).unwrap();
+}
+
+#[tokio::test]
 async fn terminal_usage_hold_saves_notice_without_extending_account_hold() {
     let rest = pool::test_prompt_context().rest_client;
     let rest = relay::RestClient { keys: nostr::Keys::generate(), ..rest };
@@ -319,7 +346,9 @@ async fn quiet_queue_wakes_at_retry_deadline_without_periodic_features() {
     let deadline = queue.next_retry_deadline().map(tokio::time::Instant::from_std);
     tokio::time::timeout(Duration::from_secs(1), pool::AgentPool::wait_for_hold_deadline(deadline)).await.unwrap();
     queue.consume_retry_deadline();
-    assert!(queue.next_retry_deadline().is_none());
+    // Dispatch is ready, but the queued request still has its absolute expiry.
+    assert_eq!(queue.next_retry_deadline(), queue.request_expiry_deadline());
+    assert!(queue.request_expiry_deadline().is_some_and(|at| at > std::time::Instant::now()));
     assert!(queue.flush_next().is_some());
     assert!(queue.next_retry_deadline().is_none());
 }

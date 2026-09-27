@@ -261,6 +261,7 @@ pub struct EventQueue {
     /// Requests promised automatic recovery must not be evicted by fresh traffic.
     protected_events: HashMap<SessionScope, RequestIds>,
     usage_notices_scheduled: HashMap<SessionScope, NoticeOwnership>,
+    usage_notice_drafts: HashMap<SessionScope, (u64, Event)>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
     account_hold_generation: u64,
@@ -311,6 +312,7 @@ impl EventQueue {
             usage_hold_deadlines: HashMap::new(),
             protected_events: HashMap::new(),
             usage_notices_scheduled: HashMap::new(),
+            usage_notice_drafts: HashMap::new(),
             account_retry_after: None,
             account_hold_generation: 0,
             account_notice_retry: None,
@@ -887,6 +889,7 @@ impl EventQueue {
     }
 
     pub(crate) fn mark_usage_notice_scheduled(&mut self, scope: SessionScope) {
+        self.usage_notice_drafts.remove(&scope);
         let ids = self.pending_request_ids(&scope);
         if !ids.is_empty() {
             self.protected_events
@@ -908,6 +911,23 @@ impl EventQueue {
             }
             notice.requests.extend(ids);
         }
+    }
+
+    pub(crate) fn usage_notice_draft(&self, scope: &SessionScope) -> Option<Event> {
+        self.usage_notice_drafts
+            .get(scope)
+            .filter(|(generation, _)| *generation == self.account_hold_generation)
+            .map(|(_, event)| event.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_account_notice_due_for_test(&mut self) {
+        self.account_notice_retry = None;
+    }
+
+    pub(crate) fn retain_usage_notice_draft(&mut self, scope: SessionScope, event: Event) {
+        self.usage_notice_drafts
+            .insert(scope, (self.account_hold_generation, event));
     }
 
     pub(crate) fn account_notice_candidates(&mut self) -> Vec<QueuedEvent> {
@@ -980,7 +1000,122 @@ impl EventQueue {
                     .map(|notice| notice.next_attempt),
             )
             .chain(self.account_notice_retry)
+            .chain(self.request_expiry_deadline())
             .min()
+    }
+
+    pub(crate) fn request_expiry_deadline(&self) -> Option<Instant> {
+        self.usage_hold_deadlines
+            .iter()
+            .flat_map(|(scope, deadlines)| {
+                let pending: RequestIds = self
+                    .queues
+                    .get(scope)
+                    .into_iter()
+                    .flatten()
+                    .map(|event| event.event.id)
+                    .chain(
+                        self.cancelled_batches
+                            .get(scope)
+                            .into_iter()
+                            .flatten()
+                            .map(|event| event.event.id),
+                    )
+                    .collect();
+                deadlines
+                    .iter()
+                    .filter_map(move |(id, deadline)| pending.contains(id).then_some(*deadline))
+            })
+            .min()
+    }
+
+    /// Expiry is independent of provider availability and account dispatch holds.
+    /// Only queued/cancelled requests transfer to terminal ownership here;
+    /// running requests finish through their ordinary result path.
+    pub(crate) fn take_expired_requests(&mut self) -> Vec<FlushBatch> {
+        let now = Instant::now();
+        let scopes: Vec<_> = self
+            .usage_hold_deadlines
+            .iter()
+            .filter(|(scope, windows)| {
+                self.queues
+                    .get(*scope)
+                    .into_iter()
+                    .flatten()
+                    .map(|event| event.event.id)
+                    .chain(
+                        self.cancelled_batches
+                            .get(*scope)
+                            .into_iter()
+                            .flatten()
+                            .map(|event| event.event.id),
+                    )
+                    .any(|id| windows.get(&id).is_some_and(|at| *at <= now))
+            })
+            .take(32)
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        let mut expired = Vec::new();
+        for scope in scopes {
+            let Some(windows) = self.usage_hold_deadlines.get_mut(&scope) else {
+                continue;
+            };
+            let mut events = Vec::new();
+            if let Some(queue) = self.queues.get_mut(&scope) {
+                let mut retained = VecDeque::new();
+                for event in queue.drain(..) {
+                    if windows.get(&event.event.id).is_some_and(|at| *at <= now) {
+                        events.push(BatchEvent {
+                            event: event.event,
+                            prompt_tag: event.prompt_tag,
+                            received_at: event.received_at,
+                        });
+                    } else {
+                        retained.push_back(event);
+                    }
+                }
+                *queue = retained;
+                if queue.is_empty() {
+                    self.queues.remove(&scope);
+                }
+            }
+            let mut cancelled_events = Vec::new();
+            if let Some(queue) = self.cancelled_batches.get_mut(&scope) {
+                let mut retained = Vec::new();
+                for event in queue.drain(..) {
+                    if windows.get(&event.event.id).is_some_and(|at| *at <= now) {
+                        cancelled_events.push(event);
+                    } else {
+                        retained.push(event);
+                    }
+                }
+                *queue = retained;
+                if queue.is_empty() {
+                    self.cancelled_batches.remove(&scope);
+                }
+            }
+            if events.is_empty() && cancelled_events.is_empty() {
+                continue;
+            }
+            for event in events.iter().chain(&cancelled_events) {
+                windows.remove(&event.event.id);
+                if let Some(counts) = self.usage_limit_holds.get_mut(&scope) {
+                    counts.remove(&event.event.id);
+                }
+            }
+            let cancel_reason = self.cancel_reasons.get(&scope).copied();
+            if !self.cancelled_batches.contains_key(&scope) {
+                self.cancel_reasons.remove(&scope);
+            }
+            expired.push(FlushBatch {
+                channel_id: scope.channel_id(),
+                scope,
+                events,
+                cancelled_events,
+                cancel_reason,
+            });
+        }
+        expired
     }
 
     #[cfg(test)]
@@ -1379,6 +1514,8 @@ impl EventQueue {
             .retain(|s, _| s.channel_id() != channel_id);
         self.usage_notices_scheduled
             .retain(|s, _| s.channel_id() != channel_id);
+        self.usage_notice_drafts
+            .retain(|s, _| s.channel_id() != channel_id);
         self.cancelled_batches
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
@@ -1625,6 +1762,7 @@ impl EventQueue {
             .chain(self.usage_notices_scheduled.keys())
             .chain(self.usage_hold_deadlines.keys())
             .chain(self.usage_limit_holds.keys())
+            .chain(self.usage_notice_drafts.keys())
             .cloned()
             .collect();
         for scope in scopes {
@@ -1647,6 +1785,9 @@ impl EventQueue {
                 if ids.is_empty() {
                     self.protected_events.remove(&scope);
                 }
+            }
+            if live.is_empty() {
+                self.usage_notice_drafts.remove(&scope);
             }
             if let Some(windows) = self.usage_hold_deadlines.get_mut(&scope) {
                 windows.retain(|id, _| live.contains(id));

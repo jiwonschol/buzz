@@ -8,6 +8,8 @@
 
 ### 저장 경계와 요청별 기한
 
+후속 4114263382는 요청 만료를 provider dispatch와 분리한다. 다음 wake-up은 account hold와 별개인 요청 기한도 포함하며, 메인 루프와 dispatch 직전에 만료된 queued/cancelled 부분만 terminal로 옮긴다. 실행 중 요청은 결과 경로가 소유한다. 4114263385는 cancelled-only terminal의 마지막 원본 이벤트로 thread anchor를 잡는다. 4114263388은 같은 보류 세대의 서명 이벤트를 먼저 보존한 뒤 저장을 시도하고, 저장·예약 모두 실패해도 새 ID를 만들지 않고 그 이벤트를 재사용한다.
+
 4114205941: rename 뒤 directory sync 실패를 주입한다. 최종 파일이 이미 존재해도 다음 저장 시 directory sync를 다시 완료해야 성공이다. 파일 존재만으로 durable 성공을 반환하지 않는다.
 
 4114205943: 종료 통지 재시도는 개별 5초~5분 지수 backoff와 한 회당 32건 제한을 갖는다. 실패한 배치의 소유권과 기존 채널 용량 예약은 유지한다.

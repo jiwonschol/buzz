@@ -3065,6 +3065,7 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        expire_held_requests(&mut queue, Some(&ctx.rest_client));
         retry_terminal_notices(&mut queue, Some(&ctx.rest_client));
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -4492,6 +4493,13 @@ fn dispatch_pending(
     last_activity: &mut tokio::time::Instant,
     observer: Option<&observer::ObserverHandle>,
 ) -> Vec<(scope::SessionScope, ThreadTags)> {
+    expire_held_requests(queue, Some(&ctx.rest_client));
+    if queue
+        .request_expiry_deadline()
+        .is_some_and(|at| at <= std::time::Instant::now())
+    {
+        return Vec::new();
+    }
     // Keyed by the exact session scope, not the channel: two threads dispatching
     // concurrently in one channel get distinct typing entries so completing one
     // never clears the other's indicator.
@@ -4729,6 +4737,26 @@ fn usage_limit_from_outcome(outcome: &PromptOutcome) -> Option<usage_limit::Usag
 const NOTICE_EXCERPT_CHARS: usize = 80;
 const NOTICE_DETAIL_EVENTS: usize = 10;
 
+fn expire_held_requests(queue: &mut EventQueue, rest: Option<&relay::RestClient>) {
+    for batch in queue.take_expired_requests() {
+        let mut content = "⚠️ The provider usage-limit retry window expired. Please re-send if this request is still needed.".to_string();
+        for event in batch
+            .events
+            .iter()
+            .chain(&batch.cancelled_events)
+            .take(NOTICE_DETAIL_EVENTS)
+        {
+            content.push_str(&format!(
+                "\nbuzz://message?channel={}&id={} — {}",
+                batch.channel_id,
+                event.event.id,
+                notice_excerpt(&event.event.content)
+            ));
+        }
+        save_terminal_notice(queue, rest, batch, content);
+    }
+}
+
 fn retry_terminal_notices(queue: &mut EventQueue, rest: Option<&relay::RestClient>) {
     for notice in queue.take_due_terminal_notices() {
         save_terminal_notice_event(
@@ -4748,13 +4776,20 @@ fn retry_terminal_notices(queue: &mut EventQueue, rest: Option<&relay::RestClien
         let saved = rest
             .context("usage notice transport unavailable")
             .and_then(|rest| {
-                pool::build_failure_notice(
-                    rest,
-                    pending.channel_id,
-                    &queue::parse_thread_tags(&pending.event),
-                    &content,
-                )
-                .and_then(|event| notice_outbox::persist_or_retry(rest, event))
+                let event = match queue.usage_notice_draft(&pending.scope) {
+                    Some(event) => event,
+                    None => {
+                        let event = pool::build_failure_notice(
+                            rest,
+                            pending.channel_id,
+                            &queue::parse_thread_tags(&pending.event),
+                            &content,
+                        )?;
+                        queue.retain_usage_notice_draft(pending.scope.clone(), event.clone());
+                        event
+                    }
+                };
+                notice_outbox::persist_or_retry(rest, event)
             });
         match saved {
             Ok(_) => queue.mark_usage_notice_scheduled(pending.scope),
@@ -4786,6 +4821,7 @@ fn save_terminal_notice_event(
             let tags = batch
                 .events
                 .last()
+                .or_else(|| batch.cancelled_events.last())
                 .map(|event| queue::parse_thread_tags(&event.event))
                 .unwrap_or_default();
             if event.is_none() {
@@ -5102,9 +5138,25 @@ fn handle_prompt_result(
                         chrono::Utc::now().to_rfc3339()
                     );
                     if let Some(rest) = rest_client {
-                        let saved =
-                            pool::build_failure_notice(rest, channel_id, &thread_tags, &content)
-                                .and_then(|event| notice_outbox::persist_or_retry(rest, event));
+                        let saved = (|| {
+                            let event = match queue.usage_notice_draft(&notice_scope) {
+                                Some(event) => event,
+                                None => {
+                                    let event = pool::build_failure_notice(
+                                        rest,
+                                        channel_id,
+                                        &thread_tags,
+                                        &content,
+                                    )?;
+                                    queue.retain_usage_notice_draft(
+                                        notice_scope.clone(),
+                                        event.clone(),
+                                    );
+                                    event
+                                }
+                            };
+                            notice_outbox::persist_or_retry(rest, event)
+                        })();
                         if let Err(error) = saved {
                             // The request lives in this loop's memory. A notice
                             // storage error must not destroy its retry path.
