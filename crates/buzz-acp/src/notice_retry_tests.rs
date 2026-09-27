@@ -156,13 +156,40 @@ async fn stale_fixture() -> (RestClient, tokio::net::TcpListener, PathBuf, Event
 
 #[tokio::test]
 async fn stale_notice_queries_old_id_then_persists_fresh_event_before_post() {
+    const CHILD_DIRECTORY: &str = "BUZZ_NOTICE_DELIVERY_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: std::env::var("BUZZ_NOTICE_TEST_RELAY").unwrap(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        // Another harness is midway through read/query/refresh/POST. A busy
+        // delivery owner must prevent this process from reading stale state.
+        drain(&rest, Path::new(&directory), &mut None)
+            .await
+            .unwrap();
+        return;
+    }
     let (rest, listener, directory, original) = stale_fixture().await;
     let path = directory.join(format!("{}.json", original.id));
     let saved_path = path.clone();
+    let child_directory = directory.clone();
+    let child_relay = rest.base_url.clone();
     let server = tokio::spawn(async move {
         let (headers, query) = respond(&listener, "[]").await;
         assert!(headers.starts_with("post /query "));
         assert_eq!(query[0]["ids"][0], original.id.to_hex());
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "notice_outbox::tests::stale_notice_queries_old_id_then_persists_fresh_event_before_post"])
+            .env(CHILD_DIRECTORY, child_directory)
+            .env("BUZZ_NOTICE_TEST_RELAY", child_relay)
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(Duration::from_secs(5), child.status())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
         let (headers, submitted) = respond(&listener, r#"{"accepted":false}"#).await;
         assert!(headers.starts_with("post /events "));
         let fresh: Event = serde_json::from_value(submitted).unwrap();
@@ -288,7 +315,7 @@ async fn failed_cleanup_cannot_starve_notices_beyond_the_pass_limit() {
     // schedule advancing or the accepted records disappearing.
     assert_eq!(
         std::fs::read_dir(&directory).unwrap().count(),
-        MAX_PER_PASS + 2
+        MAX_PER_PASS + 3
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -343,7 +370,10 @@ async fn transient_storage_failure_retries_during_hold_without_another_usage_res
     std::fs::write(&blocked, b"not a directory").unwrap();
     let destination = blocked.clone();
     let earliest_expiry = Timestamp::now().as_secs() + crate::usage_limit::MAX_HOLD_SECS;
-    persist_or_retry_in(original.clone(), move || Ok(destination.clone())).unwrap();
+    assert_eq!(
+        persist_or_retry_in(original.clone(), move || Ok(destination.clone())).unwrap(),
+        PersistOutcome::RetryScheduled
+    );
     let latest_expiry = Timestamp::now().as_secs() + crate::usage_limit::MAX_HOLD_SECS;
     tokio::task::yield_now().await;
     // The first independent retry still encounters the blocked directory.

@@ -79,17 +79,44 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         queue.make_terminal_notices_due_for_test();
         retry_terminal_notices(&mut queue, Some(&rest));
         assert!(queue.next_retry_deadline().is_some());
-        std::fs::remove_file(&path).unwrap();
         drop(full);
+        // A free memory retry slot is not a durable write. Keep ownership and
+        // prevent inactivity shutdown until the actual storage recovers.
+        queue.make_terminal_notices_due_for_test();
+        retry_terminal_notices(&mut queue, Some(&rest));
+        assert!(queue.next_retry_deadline().is_some());
+        assert!(queue.has_undispatched_work());
+        let idle_start = tokio::time::Instant::now();
+        let idle_end = idle_start + Duration::from_secs(61);
+        assert!(!inactivity_exit_due(idle_start, idle_end, Duration::from_secs(60), &queue, false));
+        std::fs::remove_file(&path).unwrap();
         queue.make_terminal_notices_due_for_test();
         retry_terminal_notices(&mut queue, Some(&rest));
         assert!(queue.next_retry_deadline().is_none());
+        assert!(!queue.has_undispatched_work());
+        assert!(inactivity_exit_due(idle_start, idle_end, Duration::from_secs(60), &queue, false));
         assert!(queue.flush_next().is_none());
         let files: Vec<_> = std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()).collect();
         assert_eq!(files.iter().filter(|path| path.extension().is_some_and(|ext| ext == "json")).count(), 1);
         for file in files { std::fs::remove_file(file).unwrap(); }
         std::fs::remove_dir(path).unwrap();
     });
+}
+
+#[tokio::test]
+async fn successful_retry_clears_hold_with_new_input_before_timer_consumption() {
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.requeue_held(one_event_batch(channel, "retry"), Duration::ZERO);
+    queue.release_in_flight(scope.clone());
+    queue.flush_next().unwrap();
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "new input"));
+    let action = run_test_outcome(&mut queue, PromptSource::Channel(scope), None,
+        PromptOutcome::Ok(acp::StopReason::EndTurn), None, HashSet::new()).await;
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(queue.usage_limit_holds(channel), 0);
+    assert_eq!(queue.queued_event_count(channel), 1);
 }
 
 #[tokio::test]

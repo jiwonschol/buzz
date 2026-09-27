@@ -597,16 +597,10 @@ impl EventQueue {
         })
     }
 
-    /// Mark the prompt for `channel_id` as complete.
-    ///
-    /// Removes the channel from `in_flight_channels` and `in_flight_deadlines`.
-    ///
-    /// If the channel was NOT requeued (no active `retry_after` throttle), the
-    /// retry counter is reset — the channel is healthy and the next failure
-    /// starts fresh. If the channel WAS requeued, `retry_counts` is left intact
-    /// so the backoff sequence continues on the next attempt.
-    ///
-    /// Also cleans up any already-expired `retry_after` entry.
+    // Legacy queue-fixture shorthand. Production result handling explicitly
+    // chooses finish_request or release_in_flight from the batch's fate;
+    // outcome regression tests exercise that production handler directly.
+    #[cfg(test)]
     pub fn mark_complete<K: IntoScope>(&mut self, scope: K) {
         let scope = scope.into_scope();
         self.release_in_flight(&scope);
@@ -617,12 +611,7 @@ impl EventQueue {
                     || self.queues.contains_key(&scope)
                     || self.cancelled_batches.contains_key(&scope) => {}
             _ => {
-                self.usage_hold_deadlines.remove(&scope);
-                self.retry_after.remove(&scope);
-                self.retry_counts.remove(&scope);
-                self.usage_limit_holds.remove(&scope);
-                self.protected_events.remove(&scope);
-                self.usage_notices_scheduled.remove(&scope);
+                self.finish_request(scope);
             }
         }
     }
@@ -635,10 +624,16 @@ impl EventQueue {
         self.in_flight_batch_sizes.remove(&scope);
     }
 
-    /// Explicit cancellation discarded the batch, even if a throttle remains.
-    pub(crate) fn discard_scope(&mut self, scope: SessionScope) {
+    /// Finish a successful or discarded request, independent of new input.
+    /// Requeued requests must use `release_in_flight` instead.
+    pub(crate) fn finish_request(&mut self, scope: SessionScope) {
+        self.release_in_flight(&scope);
+        self.usage_hold_deadlines.remove(&scope);
         self.retry_after.remove(&scope);
-        self.mark_complete(scope);
+        self.retry_counts.remove(&scope);
+        self.usage_limit_holds.remove(&scope);
+        self.protected_events.remove(&scope);
+        self.usage_notices_scheduled.remove(&scope);
     }
 
     /// Re-queue a batch of events that failed to process.
@@ -1034,9 +1029,10 @@ impl EventQueue {
     /// the maintenance timer is disabled and lazy re-wake is itself gated by
     /// flushability) would strand the batch until unrelated traffic arrives.
     ///
-    /// Covers the three tables where undispatched, non-in-flight work can
+    /// Covers the tables where undispatched, non-in-flight work can
     /// live: non-empty `queues` (throttled or not), pending `cancelled_batches`,
-    /// and `withheld_native_steer` events. Read-only (no in-flight expiry) —
+    /// `withheld_native_steer` events, and terminal notices awaiting storage.
+    /// Read-only (no in-flight expiry) —
     /// in-flight liveness is gated separately by [`has_in_flight`](Self::has_in_flight).
     pub fn has_undispatched_work(&self) -> bool {
         let has_queued = self
@@ -1051,7 +1047,7 @@ impl EventQueue {
             .withheld_native_steer
             .iter()
             .any(|(scope, v)| !v.is_empty() && !self.in_flight_scopes.contains(scope));
-        has_queued || has_cancelled || has_withheld
+        has_queued || has_cancelled || has_withheld || !self.terminal_notices.is_empty()
     }
 
     /// Number of pending partitions (session scopes) with queued events.

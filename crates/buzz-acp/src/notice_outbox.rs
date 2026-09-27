@@ -62,7 +62,8 @@ fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
         std::fs::read_dir(parent)?
             .filter(|entry| entry
                 .as_ref()
-                .map_or(true, |entry| entry.file_name() != ".admission.lock"))
+                .map_or(true, |entry| entry.file_name() != ".admission.lock"
+                    && entry.file_name() != ".delivery.lock"))
             .take(MAX_RECORDS + 1)
             .count()
             < MAX_RECORDS + usize::from(path.exists()),
@@ -124,15 +125,28 @@ fn enqueue_pending(directory: &Path, notice: &PendingNotice) -> Result<()> {
 /// Save synchronously, or reserve a bounded background persistence retry.
 /// Before the first successful save this fallback is memory-only: a process
 /// restart cannot recover a notice from storage that never accepted a write.
-pub(crate) fn persist_or_retry(rest: &RestClient, event: Event) -> Result<()> {
+pub(crate) fn persist_or_retry(rest: &RestClient, event: Event) -> Result<PersistOutcome> {
     let rest = rest.clone();
     persist_or_retry_in(event, move || directory(&rest))
+}
+
+/// Persistence ownership is distinct from a completed durable write.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PersistOutcome {
+    Stored,
+    RetryScheduled,
+}
+
+/// Transfer terminal ownership only after a synchronous durable write.
+/// The caller retains the batch and retries on any error.
+pub(crate) fn persist(rest: &RestClient, event: Event) -> Result<()> {
+    enqueue_pending(&directory(rest)?, &pending(event))
 }
 
 fn persist_or_retry_in(
     event: Event,
     directory: impl Fn() -> Result<PathBuf> + Send + 'static,
-) -> Result<()> {
+) -> Result<PersistOutcome> {
     let notice = pending(event);
     // A permanently oversized record cannot recover by waiting for storage.
     anyhow::ensure!(
@@ -140,7 +154,7 @@ fn persist_or_retry_in(
         "notice exceeds outbox record limit"
     );
     let initial_error = match directory().and_then(|path| enqueue_pending(&path, &notice)) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(PersistOutcome::Stored),
         Err(error) => error,
     };
     let runtime = tokio::runtime::Handle::try_current()
@@ -172,7 +186,7 @@ fn persist_or_retry_in(
             backoff = (backoff * 2).min(Duration::from_secs(300));
         }
     });
-    Ok(())
+    Ok(PersistOutcome::RetryScheduled)
 }
 
 // An old ID might already have been accepted before the connection failed.
@@ -233,8 +247,21 @@ async fn drain_with_remove(
     mut remove: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
     std::fs::create_dir_all(directory)?;
+    // One cross-process owner from read through query, refresh, POST and
+    // removal. The admission lock remains separate so producers can enqueue.
+    let delivery = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".delivery.lock"))?;
+    match fs2::FileExt::try_lock_exclusive(&delivery) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     let mut pending = Vec::new();
-    for entry in std::fs::read_dir(directory)?.take(MAX_RECORDS + 2) {
+    for entry in std::fs::read_dir(directory)?.take(MAX_RECORDS + 3) {
         let path = entry?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;

@@ -4767,10 +4767,16 @@ fn save_terminal_notice_event(
                     &content,
                 )?);
             }
-            notice_outbox::persist_or_retry(rest, event.as_ref().expect("notice built").clone())
+            notice_outbox::persist(
+                rest,
+                event
+                    .as_ref()
+                    .context("terminal notice was not built")?
+                    .clone(),
+            )
         });
     if let Err(error) = saved {
-        tracing::error!(channel_id = %batch.channel_id, %error, "retaining terminal request until notice can be scheduled");
+        tracing::error!(channel_id = %batch.channel_id, %error, "retaining terminal request until notice is stored");
         queue.retain_terminal_notice(batch, content, event);
     }
 }
@@ -4942,11 +4948,9 @@ fn handle_prompt_result(
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
 
-    // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
-    // deadline, and mark_complete() checks for it to decide whether to preserve
-    // retry_counts. If mark_complete runs first, retry_counts is cleared and
-    // every retry starts at attempt 1 — defeating exponential backoff and
-    // dead-letter protection.
+    // Record the fate of this dispatched batch explicitly. New queued input
+    // and elapsed retry timers cannot tell us whether this turn was requeued.
+    let mut batch_requeued = false;
     let usage_limit = usage_limit_from_outcome(&result.outcome);
     if let Some(limit) = usage_limit.as_ref().filter(|_| {
         result
@@ -4956,10 +4960,6 @@ fn handle_prompt_result(
     }) {
         queue.hold_account(limit.hold_delay(chrono::Local::now()));
     }
-    let cancellation_preserved = result
-        .batch
-        .as_ref()
-        .is_some_and(|batch| !removed_channels.contains(&batch.channel_id));
     if let Some(batch) = result.batch.take() {
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
@@ -4987,6 +4987,7 @@ fn handle_prompt_result(
                 // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
+                batch_requeued = true;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -5024,6 +5025,7 @@ fn handle_prompt_result(
                     spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
+                    batch_requeued = true;
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
             } else if let Some(limit) = usage_limit {
@@ -5050,7 +5052,9 @@ fn handle_prompt_result(
                     .unwrap_or_default();
                 let notice_scope = batch.scope.clone();
                 let notice_pending = !queue.usage_notice_scheduled(&notice_scope);
-                if let Some(dead) = queue.requeue_held(batch, delay) {
+                let dead = queue.requeue_held(batch, delay);
+                batch_requeued = dead.is_none();
+                if let Some(dead) = dead {
                     let content = format!(
                         "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
                         usage_limit::MAX_HOLD_SECS / 86_400
@@ -5112,6 +5116,8 @@ fn handle_prompt_result(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed.\n\n{details}"
                 );
                 spawn_failure_notice(rest_client, &dead, content);
+            } else {
+                batch_requeued = true;
             }
         } else {
             tracing::debug!(
@@ -5125,17 +5131,10 @@ fn handle_prompt_result(
 
     match &result.source {
         PromptSource::Channel(scope) => {
-            if matches!(
-                result.outcome,
-                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
-            ) {
-                if cancellation_preserved {
-                    queue.release_in_flight(scope.clone());
-                } else {
-                    queue.discard_scope(scope.clone());
-                }
+            if batch_requeued {
+                queue.release_in_flight(scope.clone());
             } else {
-                queue.mark_complete(scope.clone());
+                queue.finish_request(scope.clone());
             }
         }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
@@ -5396,13 +5395,13 @@ fn recover_panicked_agent(
     };
     let i = meta.agent_index;
 
-    // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
+    let mut batch_requeued = false;
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
+                batch_requeued = queue.requeue(batch).is_none();
                 tracing::warn!("requeued batch for panicked agent {i}");
             } else {
                 tracing::debug!(
@@ -5424,11 +5423,20 @@ fn recover_panicked_agent(
                 // Clear the panicked turn's exact scope so a sibling thread in
                 // the same channel keeps its typing indicator.
                 typing_channels.remove(scope);
-                queue.mark_complete(scope.clone());
+                if batch_requeued {
+                    queue.release_in_flight(scope.clone());
+                } else {
+                    queue.finish_request(scope.clone());
+                }
             }
             None => {
                 typing_channels.retain(|scope, _| scope.channel_id() != ch);
-                queue.mark_complete(ch);
+                let scope = scope::SessionScope::Conversation { channel_id: ch };
+                if batch_requeued {
+                    queue.release_in_flight(scope);
+                } else {
+                    queue.finish_request(scope);
+                }
             }
         }
         tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
