@@ -192,21 +192,19 @@ pub(crate) fn parse_reset_time(message: &str, now: DateTime<Local>) -> Option<Da
 /// the host's local zone. Parenthesized IANA names and common UTC/GMT/offset
 /// forms are recognised; unrelated explanatory parentheses are ignored.
 fn has_explicit_timezone(reset_clause: &str) -> bool {
-    reset_clause.split('(').skip(1).any(|tail| {
-        let Some((label, _)) = tail.split_once(')') else {
-            return false;
-        };
-        let label = label.trim();
-        label.contains('/')
-            || label == "utc"
-            || label == "gmt"
-            || label.starts_with("utc+")
-            || label.starts_with("utc-")
-            || label.starts_with("gmt+")
-            || label.starts_with("gmt-")
-            || label.starts_with('+')
-            || label.starts_with('-')
-    })
+    reset_clause
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '·'))
+        .any(|label| {
+            label.contains('/')
+                || label == "utc"
+                || label == "gmt"
+                || label.starts_with("utc+")
+                || label.starts_with("utc-")
+                || label.starts_with("gmt+")
+                || label.starts_with("gmt-")
+                || label.starts_with('+')
+                || label.starts_with('-')
+        })
 }
 
 fn local_at(
@@ -319,6 +317,23 @@ mod tests {
             limit.hold_delay(incident_now()),
             Duration::from_secs(FALLBACK_HOLD_SECS)
         );
+    }
+
+    #[test]
+    fn unparenthesized_timezone_uses_fallback() {
+        for clock in [
+            "3:10am UTC",
+            "15:30 GMT",
+            "15:30 +09:00",
+            "15:30 -0500",
+            "15:30 Asia/Seoul",
+        ] {
+            assert_eq!(
+                parse_reset_time(&format!("resets {clock}"), incident_now()),
+                None,
+                "{clock}"
+            );
+        }
     }
 
     #[test]

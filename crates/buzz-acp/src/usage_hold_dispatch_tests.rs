@@ -1,4 +1,38 @@
 #[tokio::test]
+async fn notice_storage_failure_keeps_request_and_loop_alive() {
+    let rest = pool::test_prompt_context().rest_client;
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..rest };
+    let path = notice_outbox::directory(&rest).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A regular file at the unique outbox path makes create_dir_all fail.
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+    let channel = Uuid::new_v4();
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "must survive"));
+    let batch = queue.flush_next().unwrap();
+    let action = run_error_outcome_with_rest(&mut queue, channel, batch, limit_error(), Some(&rest)).await;
+    std::fs::remove_file(path).unwrap();
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(queue.queued_event_count(channel), 1);
+    assert!(!queue.is_scope_in_flight(scope::SessionScope::Conversation { channel_id: channel }));
+    assert!(queue.next_retry_deadline().is_some());
+}
+
+#[tokio::test]
+async fn quiet_queue_wakes_at_retry_deadline_without_periodic_features() {
+    let channel = Uuid::new_v4();
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.requeue_held(one_event_batch(channel, "retry"), Duration::from_millis(20));
+    queue.mark_complete(channel);
+    let deadline = queue.next_retry_deadline().map(tokio::time::Instant::from_std);
+    tokio::time::timeout(Duration::from_secs(1), pool::AgentPool::wait_for_hold_deadline(deadline)).await.unwrap();
+    queue.consume_retry_deadline();
+    assert!(queue.next_retry_deadline().is_none());
+    assert!(queue.flush_next().is_some());
+    assert!(queue.next_retry_deadline().is_none());
+}
+
+#[tokio::test]
 async fn account_hold_blocks_heartbeat_and_mid_turn_controls() {
     let mut queue = EventQueue::new(DedupMode::Queue);
     let active = Uuid::new_v4();

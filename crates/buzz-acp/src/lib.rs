@@ -3064,7 +3064,6 @@ async fn tokio_main() -> Result<()> {
         HoldDeadline,
     }
 
-    let mut loop_failure = None;
     loop {
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -3206,6 +3205,9 @@ async fn tokio_main() -> Result<()> {
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
         let hold_deadline = pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT);
+        let retry_deadline = queue
+            .next_retry_deadline()
+            .map(tokio::time::Instant::from_std);
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
@@ -3249,6 +3251,9 @@ async fn tokio_main() -> Result<()> {
                     }
                 } => None,
                 _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
+                    Some(PoolEvent::HoldDeadline)
+                },
+                _ = pool::AgentPool::wait_for_hold_deadline(retry_deadline), if pool_ready => {
                     Some(PoolEvent::HoldDeadline)
                 },
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
@@ -3828,10 +3833,6 @@ async fn tokio_main() -> Result<()> {
                 match action {
                     LoopAction::Continue => {}
                     LoopAction::Exit => break,
-                    LoopAction::Failed(error) => {
-                        loop_failure = Some(error);
-                        break;
-                    }
                 }
                 if drain_ready_join_results(
                     &mut pool,
@@ -4091,6 +4092,7 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::HoldDeadline) => {
+                queue.consume_retry_deadline();
                 // A held thread must make progress even when every unrelated
                 // relay/timer source is quiet. The deadline is derived from
                 // the pool's first-held stamp, so this dispatch observes
@@ -4235,17 +4237,13 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp stopped");
     notice_outbox_task.abort();
-    match loop_failure {
-        Some(error) => Err(anyhow::anyhow!(error)),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 #[derive(PartialEq)]
 enum LoopAction {
     Continue,
     Exit,
-    Failed(String),
 }
 
 fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
@@ -4985,7 +4983,7 @@ fn handle_prompt_result(
                     spawn_failure_notice(rest_client, &dead, content);
                 } else if first_hold {
                     // Tell the channel once per hold series why the agent has
-                    // gone quiet and that nothing needs re-sending.
+                    // gone quiet, including the restart limitation.
                     let when = match &resets {
                         Some(at) => format!("once it resets at {at}"),
                         None => format!("in about {} minutes", delay.as_secs().div_ceil(60)),
@@ -4999,10 +4997,10 @@ fn handle_prompt_result(
                             pool::build_failure_notice(rest, channel_id, &thread_tags, &content)
                                 .and_then(|event| notice_outbox::enqueue(rest, event));
                         if let Err(error) = saved {
-                            pool.return_agent(result.agent);
-                            return LoopAction::Failed(format!(
-                                "persist usage-limit notice: {error:#}"
-                            ));
+                            // The request lives in this loop's memory. A notice
+                            // storage error must not destroy its retry path.
+                            tracing::error!(%channel_id, %error,
+                                "usage-limit notice was not saved; keeping held request alive");
                         }
                     }
                 }
@@ -11279,6 +11277,19 @@ mod error_outcome_emission_tests {
         batch: FlushBatch,
         error: AcpError,
     ) {
+        assert!(matches!(
+            run_error_outcome_with_rest(queue, channel_id, batch, error, None).await,
+            LoopAction::Continue
+        ));
+    }
+
+    async fn run_error_outcome_with_rest(
+        queue: &mut EventQueue,
+        channel_id: uuid::Uuid,
+        batch: FlushBatch,
+        error: AcpError,
+        rest: Option<&relay::RestClient>,
+    ) -> LoopAction {
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -11323,8 +11334,8 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             None,
-            None,
-        );
+            rest,
+        )
     }
 
     /// A usage-limit `PromptOutcome::Error` (Claude Code "hit your session

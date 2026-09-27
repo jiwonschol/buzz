@@ -24,7 +24,7 @@ struct PendingNotice {
     expired: bool,
 }
 
-fn directory(rest: &RestClient) -> Result<PathBuf> {
+pub(super) fn directory(rest: &RestClient) -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is required for the notice outbox")?;
     let scope = Sha256::digest(format!("{}\n{}", rest.base_url, rest.keys.public_key()));
     Ok(PathBuf::from(home)

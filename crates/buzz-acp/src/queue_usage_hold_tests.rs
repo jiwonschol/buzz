@@ -1,6 +1,32 @@
 // ── usage-limit hold ──────────────────────────────────────────────────
 
 #[test]
+fn in_flight_batches_reserve_channel_capacity_before_usage_errors() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    let mut batches = Vec::new();
+    for thread in 0..10 {
+        for item in 0..MAX_BATCH_EVENTS {
+            let mut event = make_queued(channel, &format!("{thread}/{item}"));
+            event.scope = SessionScope::Thread {
+                channel_id: channel,
+                root_event_id: format!("{thread:064x}"),
+            };
+            assert!(q.push(event));
+        }
+        batches.push(q.flush_next().unwrap());
+    }
+    assert!(!q.push(make_queued(channel, "eleventh batch")));
+    for batch in batches {
+        let scope = batch.scope.clone();
+        assert!(q.requeue_held(batch, Duration::from_secs(3600)).is_none());
+        q.mark_complete(scope);
+        assert!(q.channel_event_total(channel) <= MAX_PENDING_PER_CHANNEL);
+    }
+    assert_eq!(q.channel_event_total(channel), MAX_PENDING_PER_CHANNEL);
+}
+
+#[test]
 fn held_channel_capacity_rejects_the_new_event() {
     let mut q = EventQueue::new(DedupMode::Queue);
     let channel = Uuid::new_v4();

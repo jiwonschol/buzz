@@ -344,6 +344,20 @@ impl EventQueue {
             return false;
         }
         let channel_id = event.channel_id;
+        // A running batch may return on a usage limit. Reserve its capacity
+        // before accepting more work, rather than evicting protected returns.
+        let reserved: usize = self
+            .in_flight_batch_sizes
+            .iter()
+            .filter(|(scope, _)| scope.channel_id() == channel_id)
+            .map(|(_, count)| *count)
+            .sum();
+        if reserved > 0
+            && self.channel_event_total(channel_id) + reserved >= MAX_PENDING_PER_CHANNEL
+        {
+            tracing::warn!(%channel_id, "channel capacity reserved for in-flight requests — rejecting new event");
+            return false;
+        }
         let scope = event.scope.clone();
         let event_id = event.event.id;
         let queue = self.queues.entry(scope.clone()).or_default();
@@ -767,6 +781,37 @@ impl EventQueue {
             .get(&scope.into_scope())
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Next retry instant, including an elapsed deadline that has not yet
+    /// been consumed by the main loop (other select arms may have run first).
+    pub(crate) fn next_retry_deadline(&self) -> Option<Instant> {
+        self.queues
+            .keys()
+            .chain(self.cancelled_batches.keys())
+            .filter(|scope| !self.in_flight_scopes.contains(*scope))
+            .filter_map(|scope| {
+                self.retry_after
+                    .get(scope)
+                    .copied()
+                    .into_iter()
+                    .chain(self.account_retry_after)
+                    .max()
+            })
+            .min()
+    }
+
+    /// Consume only throttle timestamps, retaining protected requests and
+    /// their absolute hold window when dispatch still cannot get a worker.
+    pub(crate) fn consume_retry_deadline(&mut self) {
+        let now = Instant::now();
+        self.retry_after.retain(|_, deadline| *deadline > now);
+        if self
+            .account_retry_after
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.account_retry_after = None;
+        }
     }
 
     /// Re-queue a **complete** flushed batch preserving original `received_at`
@@ -3871,11 +3916,11 @@ mod tests {
         let remaining = MAX_PENDING_PER_CHANNEL - batch_size;
         assert_eq!(pending_count(&q), remaining);
 
-        // Push more events while the batch is "in-flight" — fill back to cap.
+        // The running batch reserves its return slots; reject fresh traffic.
         for i in 0..batch_size {
-            q.push(make_queued(ch, &format!("new-{i}")));
+            assert!(!q.push(make_queued(ch, &format!("new-{i}"))));
         }
-        assert_eq!(pending_count(&q), MAX_PENDING_PER_CHANNEL);
+        assert_eq!(pending_count(&q), remaining);
 
         // Requeue the original batch — without cap enforcement this would
         // push the queue to MAX_PENDING_PER_CHANNEL + batch_size.
