@@ -26,7 +26,7 @@ async fn notice_storage_failure_keeps_request_and_loop_alive() {
         }
     }).await.unwrap();
     let records: Vec<_> = std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()).collect();
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.iter().filter(|record| record.extension().is_some_and(|ext| ext == "json")).count(), 1);
     for record in records { std::fs::remove_file(record).unwrap(); }
     std::fs::remove_dir(path).unwrap();
 }

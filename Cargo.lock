@@ -837,6 +837,7 @@ dependencies = [
  "chrono",
  "clap",
  "evalexpr",
+ "fs2",
  "futures-util",
  "hex",
  "httparse",

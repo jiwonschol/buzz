@@ -235,7 +235,10 @@ async fn full_outbox_refuses_new_notice_without_discarding_existing_records() {
     .unwrap();
     assert!(enqueue_at(&directory, new_event).is_err());
     assert!(directory.join(format!("{}.json", original.id)).exists());
-    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), MAX_RECORDS);
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        MAX_RECORDS + 1
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -285,7 +288,50 @@ async fn failed_cleanup_cannot_starve_notices_beyond_the_pass_limit() {
     // schedule advancing or the accepted records disappearing.
     assert_eq!(
         std::fs::read_dir(&directory).unwrap().count(),
-        MAX_PER_PASS + 1
+        MAX_PER_PASS + 2
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_admission_keeps_the_disk_record_bound() {
+    let (rest, _listener, directory, _) = stale_fixture().await;
+    for index in 1..MAX_RECORDS - 1 {
+        std::fs::write(directory.join(format!("retained-{index}.tmp")), b"retained").unwrap();
+    }
+    let events: Vec<_> = (0..16)
+        .map(|_| {
+            crate::pool::build_failure_notice(
+                &rest,
+                uuid::Uuid::new_v4(),
+                &crate::queue::ThreadTags::default(),
+                "concurrent hold",
+            )
+            .unwrap()
+        })
+        .collect();
+    let barrier = std::sync::Barrier::new(events.len());
+    let accepted = std::thread::scope(|scope| {
+        let threads: Vec<_> = events
+            .into_iter()
+            .map(|event| {
+                let directory = &directory;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    enqueue_at(directory, event).is_ok()
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>()
+    });
+    assert_eq!(accepted, 1);
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        MAX_RECORDS + 1
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -26,16 +26,24 @@ struct PendingNotice {
 }
 
 pub(super) fn directory(rest: &RestClient) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is required for the notice outbox")?;
+    let home =
+        std::env::home_dir().context("home directory is unavailable for the notice outbox")?;
     let scope = Sha256::digest(format!("{}\n{}", rest.base_url, rest.keys.public_key()));
-    Ok(PathBuf::from(home)
-        .join(".buzz/notice-outbox")
-        .join(hex::encode(scope)))
+    Ok(home.join(".buzz/notice-outbox").join(hex::encode(scope)))
 }
 
 fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
     let parent = path.parent().context("notice path has no parent")?;
     std::fs::create_dir_all(parent)?;
+    // A persistent OS lock is released on process exit. Never unlink it: all
+    // writers must lock the same inode, including independent harnesses.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(parent.join(".admission.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock)?;
     let bytes = serde_json::to_vec(notice)?;
     anyhow::ensure!(
         bytes.len() as u64 <= MAX_RECORD_BYTES,
@@ -44,7 +52,13 @@ fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
     // Include abandoned temporary files in the bound. Repeated disk failures
     // must not accumulate a new temporary record on every worker pass.
     anyhow::ensure!(
-        std::fs::read_dir(parent)?.take(MAX_RECORDS + 1).count() <= MAX_RECORDS,
+        std::fs::read_dir(parent)?
+            .filter(|entry| entry
+                .as_ref()
+                .map_or(true, |entry| entry.file_name() != ".admission.lock"))
+            .take(MAX_RECORDS + 1)
+            .count()
+            < MAX_RECORDS + usize::from(path.exists()),
         "notice outbox temporary-record limit reached"
     );
     let temporary = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
@@ -59,6 +73,7 @@ fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
     let result = (|| -> std::io::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
+        drop(file);
         std::fs::rename(&temporary, path)
     })();
     if let Err(error) = result {
@@ -96,10 +111,6 @@ fn enqueue_pending(directory: &Path, notice: &PendingNotice) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    anyhow::ensure!(
-        std::fs::read_dir(directory)?.take(MAX_RECORDS).count() < MAX_RECORDS,
-        "notice outbox is full; retained records require operator attention"
-    );
     save(&path, notice)
 }
 
@@ -216,7 +227,7 @@ async fn drain_with_remove(
 ) -> Result<()> {
     std::fs::create_dir_all(directory)?;
     let mut pending = Vec::new();
-    for entry in std::fs::read_dir(directory)?.take(MAX_RECORDS + 1) {
+    for entry in std::fs::read_dir(directory)?.take(MAX_RECORDS + 2) {
         let path = entry?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;

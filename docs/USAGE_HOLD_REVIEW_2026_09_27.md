@@ -76,6 +76,20 @@ backoff하고 한 pass는 최대 32건을 순환 처리한다.
 
 ## 검증 기록
 
+9ed5b469의 후속 리뷰 두 건도 반영한다. 4113730782는 `std::env::home_dir`로
+Windows 프로필과 Unix 계정 홈 fallback을 사용한다. 4113730784는 저장소에서 이미
+사용하는 fs2 0.4.3의 OS 파일 잠금으로 용량 확인부터 저장까지 직렬화한다.
+잠금 충돌은 기존 저장 재시도로 돌아가며, 프로세스 종료 시 OS가 잠금을 해제한다.
+영구 `.admission.lock` 하나는 레코드 수에서 제외하며 삭제하지 않는다.
+16개 동시 쓰기가 남은 한 자리에 입장하는 회귀로 1,024 레코드 상한을 검증한다.
+표준 File 잠금은 Rust 1.89부터라 현재 MSRV 1.88에서 쓸 수 없다.
+근거: https://doc.rust-lang.org/std/env/fn.home_dir.html 및
+https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock.
+
+9ed5b469 전체 CI는 기존 Pi 실행기 시험의 `Text file busy`로 exit 1이었다.
+같은 SHA의 ACP/core 전체 재시험은 1,250 PASS·exit 0이었다.
+후속 단계 실행은 새 리뷰 수정으로 중단했으며 전체 CI PASS로 취급하지 않는다.
+
 4ee6e951 이후 다섯 건 수정 트리의 전체 시험은 ACP 981 + integration 9 + core 258 +
 doctest 2, 총 1,250 PASS다. 로그는 `buzz-review-round4-tests.log`다.
 unused test 변수 경고는 이후 이름 수정으로 제거했다. 최종 SHA 검사는 PR 본문에 확정한다.
