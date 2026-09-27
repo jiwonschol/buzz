@@ -14,6 +14,7 @@ const FRESHNESS_SECS: u64 = 900;
 const MAX_PER_PASS: usize = 32;
 const MAX_RECORDS: usize = 1024;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
+static PERSIST_RETRIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_RECORDS);
 
 #[derive(Serialize, Deserialize)]
 struct PendingNotice {
@@ -73,9 +74,25 @@ fn save(path: &Path, notice: &PendingNotice) -> Result<()> {
     Ok(())
 }
 
+fn pending(event: Event) -> PendingNotice {
+    let now = Timestamp::now().as_secs();
+    PendingNotice {
+        event,
+        expires_at: now.saturating_add(crate::usage_limit::MAX_HOLD_SECS),
+        next_attempt_at: now,
+        backoff_secs: POLL_SECS,
+        expired: false,
+    }
+}
+
+#[cfg(test)]
 fn enqueue_at(directory: &Path, event: Event) -> Result<()> {
+    enqueue_pending(directory, &pending(event))
+}
+
+fn enqueue_pending(directory: &Path, notice: &PendingNotice) -> Result<()> {
     std::fs::create_dir_all(directory)?;
-    let path = directory.join(format!("{}.json", event.id));
+    let path = directory.join(format!("{}.json", notice.event.id));
     if path.exists() {
         return Ok(());
     }
@@ -83,21 +100,61 @@ fn enqueue_at(directory: &Path, event: Event) -> Result<()> {
         std::fs::read_dir(directory)?.take(MAX_RECORDS).count() < MAX_RECORDS,
         "notice outbox is full; retained records require operator attention"
     );
-    let now = Timestamp::now().as_secs();
-    save(
-        &path,
-        &PendingNotice {
-            event,
-            expires_at: now.saturating_add(crate::usage_limit::MAX_HOLD_SECS),
-            next_attempt_at: now,
-            backoff_secs: POLL_SECS,
-            expired: false,
-        },
-    )
+    save(&path, notice)
 }
 
-pub(crate) fn enqueue(rest: &RestClient, event: Event) -> Result<()> {
-    enqueue_at(&directory(rest)?, event)
+/// Save synchronously, or reserve a bounded background persistence retry.
+/// Before the first successful save this fallback is memory-only: a process
+/// restart cannot recover a notice from storage that never accepted a write.
+pub(crate) fn persist_or_retry(rest: &RestClient, event: Event) -> Result<()> {
+    let rest = rest.clone();
+    persist_or_retry_in(event, move || directory(&rest))
+}
+
+fn persist_or_retry_in(
+    event: Event,
+    directory: impl Fn() -> Result<PathBuf> + Send + 'static,
+) -> Result<()> {
+    let notice = pending(event);
+    // A permanently oversized record cannot recover by waiting for storage.
+    anyhow::ensure!(
+        serde_json::to_vec(&notice)?.len() as u64 <= MAX_RECORD_BYTES,
+        "notice exceeds outbox record limit"
+    );
+    let initial_error = match directory().and_then(|path| enqueue_pending(&path, &notice)) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let runtime = tokio::runtime::Handle::try_current()
+        .context("notice persistence failed and no retry runtime is available")?;
+    let permit = PERSIST_RETRIES
+        .try_acquire()
+        .context("notice persistence failed and the retry queue is full")?;
+    tracing::error!(event_id = %notice.event.id, %initial_error,
+        "notice persistence pending in memory; retry scheduled");
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS);
+    runtime.spawn(async move {
+        let _permit = permit;
+        let mut backoff = Duration::from_secs(POLL_SECS);
+        loop {
+            tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+            if tokio::time::Instant::now() >= deadline
+                || Timestamp::now().as_secs() >= notice.expires_at
+            {
+                tracing::error!(event_id = %notice.event.id,
+                    "notice persistence retry expired before storage recovered");
+                return;
+            }
+            match directory().and_then(|path| enqueue_pending(&path, &notice)) {
+                Ok(()) => return,
+                Err(error) => tracing::error!(event_id = %notice.event.id, %error,
+                    "notice persistence still pending in memory"),
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(300));
+        }
+    });
+    Ok(())
 }
 
 // An old ID might already have been accepted before the connection failed.

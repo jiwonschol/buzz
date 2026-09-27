@@ -289,3 +289,29 @@ async fn failed_cleanup_cannot_starve_notices_beyond_the_pass_limit() {
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn transient_storage_failure_retries_during_hold_without_another_usage_result() {
+    let (_rest, _listener, directory, original) = stale_fixture().await;
+    let blocked = directory.join("blocked-outbox");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let destination = blocked.clone();
+    let earliest_expiry = Timestamp::now().as_secs() + crate::usage_limit::MAX_HOLD_SECS;
+    persist_or_retry_in(original.clone(), move || Ok(destination.clone())).unwrap();
+    let latest_expiry = Timestamp::now().as_secs() + crate::usage_limit::MAX_HOLD_SECS;
+    tokio::task::yield_now().await;
+    // The first independent retry still encounters the blocked directory.
+    tokio::time::advance(Duration::from_secs(POLL_SECS)).await;
+    tokio::task::yield_now().await;
+    assert!(blocked.is_file());
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    // No new usage outcome, no second persist call: the existing task saves it.
+    tokio::time::advance(Duration::from_secs(POLL_SECS * 2)).await;
+    tokio::task::yield_now().await;
+    let path = blocked.join(format!("{}.json", original.id));
+    let stored: PendingNotice = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(stored.event.id, original.id);
+    assert!((earliest_expiry..=latest_expiry).contains(&stored.expires_at));
+    std::fs::remove_dir_all(directory).unwrap();
+}

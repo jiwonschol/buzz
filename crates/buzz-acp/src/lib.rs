@@ -3253,7 +3253,7 @@ async fn tokio_main() -> Result<()> {
                 _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
                     Some(PoolEvent::HoldDeadline)
                 },
-                _ = pool::AgentPool::wait_for_hold_deadline(retry_deadline), if pool_ready => {
+                _ = pool::AgentPool::wait_for_hold_deadline(retry_deadline) => {
                     Some(PoolEvent::HoldDeadline)
                 },
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
@@ -4093,6 +4093,11 @@ async fn tokio_main() -> Result<()> {
             }
             Some(PoolEvent::HoldDeadline) => {
                 queue.consume_retry_deadline();
+                if !pool_ready {
+                    // Re-enter the lazy lifecycle at the top of the loop.
+                    // No periodic feature or new relay event is required.
+                    continue;
+                }
                 // A held thread must make progress even when every unrelated
                 // relay/timer source is quiet. The deadline is derived from
                 // the pool's first-held stamp, so this dispatch observes
@@ -4721,6 +4726,7 @@ fn usage_limit_from_outcome(outcome: &PromptOutcome) -> Option<usage_limit::Usag
 
 /// Maximum characters of an event's content quoted in a failure notice.
 const NOTICE_EXCERPT_CHARS: usize = 80;
+const NOTICE_DETAIL_EVENTS: usize = 10;
 
 /// Describe the events of a failed batch for a channel notice: which agent
 /// and turn they belonged to, and one `buzz://message` deep link per event
@@ -4732,19 +4738,28 @@ const NOTICE_EXCERPT_CHARS: usize = 80;
 /// in Buzz Desktop even when the notice cannot be threaded under it.
 fn describe_batch_events(batch: &FlushBatch, turn_id: &str, config: &Config) -> String {
     let affected_count = batch.cancelled_events.len() + batch.events.len();
+    let turn_id = notice_excerpt(turn_id);
     let mut out = format!(
         "Affected: {} event(s) for {}, turn `{turn_id}`",
         affected_count,
-        agent_label(config)
+        notice_excerpt(&agent_label(config))
     );
-    for be in batch.cancelled_events.iter().chain(&batch.events) {
+    for be in batch
+        .cancelled_events
+        .iter()
+        .chain(&batch.events)
+        .take(NOTICE_DETAIL_EVENTS)
+    {
         let event = &be.event;
         let mut link = format!(
             "buzz://message?channel={}&id={}",
             batch.channel_id,
             event.id.to_hex()
         );
-        if let Some(root) = queue::parse_thread_tags(event).root_event_id {
+        if let Some(root) = queue::parse_thread_tags(event)
+            .root_event_id
+            .filter(|root| nostr::EventId::from_hex(root).is_ok())
+        {
             link.push_str("&thread=");
             link.push_str(&root);
         }
@@ -4764,6 +4779,12 @@ fn describe_batch_events(batch: &FlushBatch, turn_id: &str, config: &Config) -> 
                 .unwrap_or_else(|| event.created_at.as_secs().to_string());
         let excerpt = notice_excerpt(&event.content);
         out.push_str(&format!("\n• {link} — {author}… at {when}: “{excerpt}”"));
+    }
+    if affected_count > NOTICE_DETAIL_EVENTS {
+        out.push_str(&format!(
+            "\n… {} more event(s); see the channel history.",
+            affected_count - NOTICE_DETAIL_EVENTS
+        ));
     }
     out
 }
@@ -4887,11 +4908,13 @@ fn handle_prompt_result(
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
     let usage_limit = usage_limit_from_outcome(&result.outcome);
-    if result.batch.is_none() {
-        if let Some(limit) = &usage_limit {
-            queue.hold_account(limit.hold_delay(chrono::Local::now()));
-        }
+    if let Some(limit) = &usage_limit {
+        queue.hold_account(limit.hold_delay(chrono::Local::now()));
     }
+    let cancellation_preserved = result
+        .batch
+        .as_ref()
+        .is_some_and(|batch| !removed_channels.contains(&batch.channel_id));
     if let Some(batch) = result.batch.take() {
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
@@ -4981,7 +5004,7 @@ fn handle_prompt_result(
                     .map(|be| queue::parse_thread_tags(&be.event))
                     .unwrap_or_default();
                 let notice_scope = batch.scope.clone();
-                let notice_pending = !queue.usage_notice_saved(&notice_scope);
+                let notice_pending = !queue.usage_notice_scheduled(&notice_scope);
                 if let Some(dead) = queue.requeue_held(batch, delay) {
                     let content = format!(
                         "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
@@ -5002,14 +5025,14 @@ fn handle_prompt_result(
                     if let Some(rest) = rest_client {
                         let saved =
                             pool::build_failure_notice(rest, channel_id, &thread_tags, &content)
-                                .and_then(|event| notice_outbox::enqueue(rest, event));
+                                .and_then(|event| notice_outbox::persist_or_retry(rest, event));
                         if let Err(error) = saved {
                             // The request lives in this loop's memory. A notice
                             // storage error must not destroy its retry path.
                             tracing::error!(%channel_id, %error,
-                                "usage-limit notice was not saved; keeping held request alive");
+                                "usage-limit notice retry could not be scheduled; keeping held request alive");
                         } else {
-                            queue.mark_usage_notice_saved(notice_scope);
+                            queue.mark_usage_notice_scheduled(notice_scope);
                         }
                     }
                 }
@@ -5061,7 +5084,11 @@ fn handle_prompt_result(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
-                queue.release_in_flight(scope.clone());
+                if cancellation_preserved {
+                    queue.release_in_flight(scope.clone());
+                } else {
+                    queue.discard_scope(scope.clone());
+                }
             } else {
                 queue.mark_complete(scope.clone());
             }
@@ -11325,6 +11352,25 @@ mod error_outcome_emission_tests {
         error: AcpError,
         rest: Option<&relay::RestClient>,
     ) -> LoopAction {
+        run_test_outcome(
+            queue,
+            source,
+            batch,
+            PromptOutcome::Error(error),
+            rest,
+            HashSet::new(),
+        )
+        .await
+    }
+
+    async fn run_test_outcome(
+        queue: &mut EventQueue,
+        source: PromptSource,
+        batch: Option<FlushBatch>,
+        outcome: PromptOutcome,
+        rest: Option<&relay::RestClient>,
+        removed_channels: HashSet<Uuid>,
+    ) -> LoopAction {
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -11343,7 +11389,6 @@ mod error_outcome_emission_tests {
         );
         let config = test_config();
         let mut heartbeat_in_flight = false;
-        let removed_channels = std::collections::HashSet::new();
         let mut crash_history = vec![SlotCircuit {
             crash_times: Vec::new(),
             open_until: None,
@@ -11355,7 +11400,7 @@ mod error_outcome_emission_tests {
             agent,
             source,
             turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::Error(error),
+            outcome,
             batch,
         };
         handle_prompt_result(

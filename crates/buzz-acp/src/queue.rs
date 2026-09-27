@@ -236,7 +236,7 @@ pub struct EventQueue {
     usage_hold_deadlines: HashMap<SessionScope, Instant>,
     /// Requests promised automatic recovery must not be evicted by fresh traffic.
     protected_events: HashMap<SessionScope, HashSet<nostr::EventId>>,
-    usage_notices_saved: HashSet<SessionScope>,
+    usage_notices_scheduled: HashSet<SessionScope>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
     dedup_mode: DedupMode,
@@ -282,7 +282,7 @@ impl EventQueue {
             usage_limit_holds: HashMap::new(),
             usage_hold_deadlines: HashMap::new(),
             protected_events: HashMap::new(),
-            usage_notices_saved: HashSet::new(),
+            usage_notices_scheduled: HashSet::new(),
             account_retry_after: None,
             dedup_mode,
             cancelled_batches: HashMap::new(),
@@ -609,7 +609,7 @@ impl EventQueue {
                 self.retry_counts.remove(&scope);
                 self.usage_limit_holds.remove(&scope);
                 self.protected_events.remove(&scope);
-                self.usage_notices_saved.remove(&scope);
+                self.usage_notices_scheduled.remove(&scope);
             }
         }
     }
@@ -620,6 +620,12 @@ impl EventQueue {
         self.in_flight_scopes.remove(&scope);
         self.in_flight_deadlines.remove(&scope);
         self.in_flight_batch_sizes.remove(&scope);
+    }
+
+    /// Explicit cancellation discarded the batch, even if a throttle remains.
+    pub(crate) fn discard_scope(&mut self, scope: SessionScope) {
+        self.retry_after.remove(&scope);
+        self.mark_complete(scope);
     }
 
     /// Re-queue a batch of events that failed to process.
@@ -661,7 +667,7 @@ impl EventQueue {
             self.usage_limit_holds.remove(&scope);
             self.usage_hold_deadlines.remove(&scope);
             self.protected_events.remove(&scope);
-            self.usage_notices_saved.remove(&scope);
+            self.usage_notices_scheduled.remove(&scope);
             // Also clear retry_after so fresh traffic on this scope isn't
             // throttled by stale backoff from the discarded poison batch.
             self.retry_after.remove(&scope);
@@ -747,7 +753,7 @@ impl EventQueue {
             self.usage_limit_holds.remove(&scope);
             self.usage_hold_deadlines.remove(&scope);
             self.protected_events.remove(&scope);
-            self.usage_notices_saved.remove(&scope);
+            self.usage_notices_scheduled.remove(&scope);
             self.retry_counts.remove(&scope);
             self.retry_after.remove(&scope);
             return Some(batch);
@@ -787,12 +793,12 @@ impl EventQueue {
             .unwrap_or(0)
     }
 
-    pub(crate) fn usage_notice_saved(&self, scope: &SessionScope) -> bool {
-        self.usage_notices_saved.contains(scope)
+    pub(crate) fn usage_notice_scheduled(&self, scope: &SessionScope) -> bool {
+        self.usage_notices_scheduled.contains(scope)
     }
 
-    pub(crate) fn mark_usage_notice_saved(&mut self, scope: SessionScope) {
-        self.usage_notices_saved.insert(scope);
+    pub(crate) fn mark_usage_notice_scheduled(&mut self, scope: SessionScope) {
+        self.usage_notices_scheduled.insert(scope);
     }
 
     pub(crate) fn hold_account(&mut self, delay: Duration) {
@@ -1117,7 +1123,7 @@ impl EventQueue {
             .retain(|s, _| s.channel_id() != channel_id);
         self.protected_events
             .retain(|s, _| s.channel_id() != channel_id);
-        self.usage_notices_saved
+        self.usage_notices_scheduled
             .retain(|s| s.channel_id() != channel_id);
         self.cancelled_batches
             .retain(|s, _| s.channel_id() != channel_id);
@@ -1340,7 +1346,7 @@ impl EventQueue {
             .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
         self.usage_hold_deadlines
             .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
-        self.usage_notices_saved
+        self.usage_notices_scheduled
             .retain(|scope| self.usage_limit_holds.contains_key(scope));
     }
 }

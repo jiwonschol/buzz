@@ -17,12 +17,14 @@ async fn notice_storage_failure_keeps_request_and_loop_alive() {
     assert!(!queue.is_scope_in_flight(scope::SessionScope::Conversation { channel_id: channel }));
     assert!(queue.next_retry_deadline().is_some());
     let scope = scope::SessionScope::Conversation { channel_id: channel };
-    assert!(!queue.usage_notice_saved(&scope));
-    queue.expire_retry_for_test();
-    let retry = queue.flush_next().unwrap();
-    let action = run_error_outcome_with_rest(&mut queue, channel, retry, limit_error(), Some(&rest)).await;
-    assert!(matches!(action, LoopAction::Continue));
-    assert!(queue.usage_notice_saved(&scope));
+    assert!(queue.usage_notice_scheduled(&scope));
+    // No second prompt result: the independent persistence retry must save it.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if std::fs::read_dir(&path).is_ok_and(|entries| entries.flatten().any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))) { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.unwrap();
     let records: Vec<_> = std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()).collect();
     assert_eq!(records.len(), 1);
     for record in records { std::fs::remove_file(record).unwrap(); }
@@ -40,6 +42,60 @@ async fn heartbeat_usage_error_holds_account_without_a_batch() {
     dispatch_heartbeat(&mut pool, &queue, &Arc::new(pool::test_prompt_context()), &mut in_flight);
     assert!(!in_flight);
     assert!(pool.any_idle());
+}
+
+#[tokio::test]
+async fn removed_channel_usage_error_still_holds_other_work() {
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    let action = run_test_outcome(&mut queue, PromptSource::Channel(scope), Some(one_event_batch(channel, "removed")), PromptOutcome::Error(limit_error()), None, HashSet::from([channel])).await;
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(queue.is_account_held());
+    assert_eq!(queue.queued_event_count(channel), 0);
+    queue.requeue_preserve_timestamps(one_event_batch(Uuid::new_v4(), "other request"));
+    assert!(queue.flush_next().is_none());
+}
+
+#[tokio::test]
+async fn explicit_cancel_without_batch_clears_previous_hold_metadata() {
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.set_usage_limit_holds_for_test(channel, 5);
+    queue.set_retry_count_for_test(channel, 9);
+    queue.mark_usage_notice_scheduled(scope.clone());
+    let action = run_test_outcome(&mut queue, PromptSource::Channel(scope.clone()), None, PromptOutcome::Cancelled, None, HashSet::new()).await;
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(queue.usage_limit_holds(channel), 0);
+    assert_eq!(queue.retry_count_for_test(channel), 0);
+    assert!(!queue.usage_notice_scheduled(&scope));
+}
+
+#[test]
+fn maximum_cancelled_batch_has_bounded_notice_details() {
+    let channel = Uuid::new_v4();
+    let mut batch = one_event_batch(channel, "latest");
+    for _ in 0..499 {
+        batch.cancelled_events.extend(one_event_batch(channel, &"🦀".repeat(80)).events);
+    }
+    let details = describe_batch_events(&batch, &"turn".repeat(1000), &test_config());
+    assert!(details.contains("490 more event(s)"));
+    let rest = pool::test_prompt_context().rest_client;
+    let notice = pool::build_failure_notice(&rest, channel, &queue::ThreadTags::default(), &details).unwrap();
+    assert!(serde_json::to_vec(&notice).unwrap().len() < 16 * 1024);
+}
+
+#[tokio::test]
+async fn retry_timer_releases_work_for_a_sleeping_lazy_pool() {
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    queue.hold_account(Duration::from_millis(20));
+    queue.requeue_preserve_timestamps(one_event_batch(Uuid::new_v4(), "sleeping pool request"));
+    assert!(!queue.has_flushable_work());
+    // Same unguarded timer as select!: no ready pool or heartbeat required.
+    pool::AgentPool::wait_for_hold_deadline(queue.next_retry_deadline().map(tokio::time::Instant::from_std)).await;
+    queue.consume_retry_deadline();
+    assert!(queue.has_flushable_work());
 }
 
 #[tokio::test]
