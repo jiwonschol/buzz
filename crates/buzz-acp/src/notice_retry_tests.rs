@@ -69,7 +69,7 @@ async fn notice_retries_the_same_signed_event_after_relay_failure() {
     });
     tokio::time::timeout(Duration::from_secs(25), async {
         for _ in 0..3 {
-            drain(&rest, &directory).await.unwrap();
+            drain(&rest, &directory, &mut None).await.unwrap();
             if path.exists() {
                 // Simulate restart: only the durable record survives.
                 let mut pending: PendingNotice =
@@ -173,7 +173,7 @@ async fn stale_notice_queries_old_id_then_persists_fresh_event_before_post() {
             serde_json::from_slice(&std::fs::read(saved_path).unwrap()).unwrap();
         assert_eq!(persisted.event.id, fresh.id);
     });
-    drain(&rest, &directory).await.unwrap();
+    drain(&rest, &directory, &mut None).await.unwrap();
     server.await.unwrap();
     assert!(path.exists());
     std::fs::remove_dir_all(directory).unwrap();
@@ -192,7 +192,7 @@ async fn stale_notice_already_accepted_is_not_posted_again() {
                 .is_err()
         );
     });
-    drain(&rest, &directory).await.unwrap();
+    drain(&rest, &directory, &mut None).await.unwrap();
     assert!(!path.exists());
     server.await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
@@ -205,7 +205,7 @@ async fn invalid_lookup_preserves_old_identity_and_expiry_retains_record() {
     let server = tokio::spawn(async move {
         respond(&listener, "{}").await;
     });
-    drain(&rest, &directory).await.unwrap();
+    drain(&rest, &directory, &mut None).await.unwrap();
     server.await.unwrap();
     let mut persisted: PendingNotice =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -213,7 +213,7 @@ async fn invalid_lookup_preserves_old_identity_and_expiry_retains_record() {
     persisted.expires_at = 0;
     persisted.next_attempt_at = 0;
     save(&path, &persisted).unwrap();
-    drain(&rest, &directory).await.unwrap();
+    drain(&rest, &directory, &mut None).await.unwrap();
     let expired: PendingNotice = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(expired.expired);
     assert_eq!(expired.event.id, original.id);
@@ -236,5 +236,56 @@ async fn full_outbox_refuses_new_notice_without_discarding_existing_records() {
     assert!(enqueue_at(&directory, new_event).is_err());
     assert!(directory.join(format!("{}.json", original.id)).exists());
     assert_eq!(std::fs::read_dir(&directory).unwrap().count(), MAX_RECORDS);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn failed_cleanup_cannot_starve_notices_beyond_the_pass_limit() {
+    let (rest, listener, directory, original) = stale_fixture().await;
+    // This fixture's original stale record is replaced with a current event
+    // so every attempt exercises POST followed by the failing cleanup seam.
+    std::fs::remove_file(directory.join(format!("{}.json", original.id))).unwrap();
+    for index in 0..=MAX_PER_PASS {
+        let event = crate::pool::build_failure_notice(
+            &rest,
+            uuid::Uuid::new_v4(),
+            &crate::queue::ThreadTags::default(),
+            &format!("hold {index}"),
+        )
+        .unwrap();
+        enqueue_at(&directory, event).unwrap();
+    }
+    let server = tokio::spawn(async move {
+        let mut delivered = std::collections::HashSet::new();
+        for _ in 0..MAX_PER_PASS * 2 {
+            let (headers, event) = respond(&listener, r#"{"accepted":true}"#).await;
+            assert!(headers.starts_with("post /events "));
+            delivered.insert(event["id"].as_str().unwrap().to_owned());
+        }
+        delivered
+    });
+    let mut cursor = None;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for _ in 0..2 {
+            drain_with_remove(&rest, &directory, &mut cursor, |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "outbox directory is read-only",
+                ))
+            })
+            .await
+            .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let delivered = server.await.unwrap();
+    assert_eq!(delivered.len(), MAX_PER_PASS + 1);
+    // Cleanup failed for every record: fairness cannot depend on any on-disk
+    // schedule advancing or the accepted records disappearing.
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        MAX_PER_PASS + 1
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }

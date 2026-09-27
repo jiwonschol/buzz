@@ -1,6 +1,72 @@
 // ── usage-limit hold ──────────────────────────────────────────────────
 
 #[test]
+fn maintenance_preserves_due_retry_wake_until_consumed() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    q.push(make_queued(channel, "retry"));
+    q.retry_after.insert(conv(channel), Instant::now());
+    q.compact_expired_state();
+    assert!(q.next_retry_deadline().is_some());
+    q.consume_retry_deadline();
+    assert!(q.next_retry_deadline().is_none());
+    assert!(q.flush_next().is_some());
+}
+
+#[test]
+fn cancellation_carryover_keeps_capacity_across_every_return_path() {
+    for path in ["held", "retry", "preserve", "cancelled"] {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        for i in 0..MAX_PENDING_PER_CHANNEL {
+            assert!(q.push(make_queued(channel, &format!("original-{i}"))));
+            let batch = q.flush_next().unwrap();
+            q.requeue_as_cancelled(batch, CancelReason::Interrupt);
+            q.release_in_flight(channel);
+            assert_eq!(q.channel_event_total(channel), i + 1);
+        }
+        assert!(!q.push(make_queued(channel, "overflow")));
+        let batch = q.flush_next().unwrap();
+        assert_eq!(batch.events.len() + batch.cancelled_events.len(), MAX_PENDING_PER_CHANNEL);
+        assert!(!q.push(make_queued(channel, "in-flight overflow")));
+        match path {
+            "held" => { assert!(q.requeue_held(batch, Duration::from_secs(3600)).is_none()); }
+            "retry" => { assert!(q.requeue(batch).is_none()); }
+            "preserve" => q.requeue_preserve_timestamps(batch),
+            _ => q.requeue_as_cancelled(batch, CancelReason::Interrupt),
+        }
+        q.release_in_flight(channel);
+        assert_eq!(q.channel_event_total(channel), MAX_PENDING_PER_CHANNEL, "{path}");
+        let accepted = q.push(make_queued(channel, "post-return overflow"));
+        if matches!(path, "held" | "cancelled") {
+            assert!(!accepted, "{path}");
+        }
+        assert_eq!(q.channel_event_total(channel), MAX_PENDING_PER_CHANNEL, "{path}");
+    }
+}
+
+#[test]
+fn transient_failure_preserves_merged_cancelled_requests() {
+    let mut q = EventQueue::new(DedupMode::Queue);
+    let channel = Uuid::new_v4();
+    q.push(make_queued(channel, "original"));
+    let first = q.flush_next().unwrap();
+    let original = first.events[0].event.id;
+    q.requeue_as_cancelled(first, CancelReason::Interrupt);
+    q.release_in_flight(channel);
+    q.push(make_queued(channel, "followup"));
+    let merged = q.flush_next().unwrap();
+    assert_eq!(merged.cancelled_events[0].event.id, original);
+    assert_eq!(q.in_flight_batch_sizes[&conv(channel)], 2);
+    assert!(q.requeue(merged).is_none());
+    q.release_in_flight(channel);
+    q.expire_retry_for_test();
+    let retried = q.flush_next().unwrap();
+    assert_eq!(retried.cancelled_events[0].event.id, original);
+    assert_eq!(retried.events.len(), 1);
+}
+
+#[test]
 fn in_flight_batches_reserve_channel_capacity_before_usage_errors() {
     let mut q = EventQueue::new(DedupMode::Queue);
     let channel = Uuid::new_v4();

@@ -11,11 +11,35 @@ async fn notice_storage_failure_keeps_request_and_loop_alive() {
     queue.requeue_preserve_timestamps(one_event_batch(channel, "must survive"));
     let batch = queue.flush_next().unwrap();
     let action = run_error_outcome_with_rest(&mut queue, channel, batch, limit_error(), Some(&rest)).await;
-    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(&path).unwrap();
     assert!(matches!(action, LoopAction::Continue));
     assert_eq!(queue.queued_event_count(channel), 1);
     assert!(!queue.is_scope_in_flight(scope::SessionScope::Conversation { channel_id: channel }));
     assert!(queue.next_retry_deadline().is_some());
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    assert!(!queue.usage_notice_saved(&scope));
+    queue.expire_retry_for_test();
+    let retry = queue.flush_next().unwrap();
+    let action = run_error_outcome_with_rest(&mut queue, channel, retry, limit_error(), Some(&rest)).await;
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(queue.usage_notice_saved(&scope));
+    let records: Vec<_> = std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(records.len(), 1);
+    for record in records { std::fs::remove_file(record).unwrap(); }
+    std::fs::remove_dir(path).unwrap();
+}
+
+#[tokio::test]
+async fn heartbeat_usage_error_holds_account_without_a_batch() {
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    let action = run_prompt_error(&mut queue, PromptSource::Heartbeat, None, limit_error(), None).await;
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(queue.is_account_held());
+    let mut pool = AgentPool::from_slots(vec![Some(dummy_agent(0).await)]);
+    let mut in_flight = false;
+    dispatch_heartbeat(&mut pool, &queue, &Arc::new(pool::test_prompt_context()), &mut in_flight);
+    assert!(!in_flight);
+    assert!(pool.any_idle());
 }
 
 #[tokio::test]

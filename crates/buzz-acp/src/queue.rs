@@ -236,6 +236,7 @@ pub struct EventQueue {
     usage_hold_deadlines: HashMap<SessionScope, Instant>,
     /// Requests promised automatic recovery must not be evicted by fresh traffic.
     protected_events: HashMap<SessionScope, HashSet<nostr::EventId>>,
+    usage_notices_saved: HashSet<SessionScope>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
     dedup_mode: DedupMode,
@@ -281,6 +282,7 @@ impl EventQueue {
             usage_limit_holds: HashMap::new(),
             usage_hold_deadlines: HashMap::new(),
             protected_events: HashMap::new(),
+            usage_notices_saved: HashSet::new(),
             account_retry_after: None,
             dedup_mode,
             cancelled_batches: HashMap::new(),
@@ -394,7 +396,19 @@ impl EventQueue {
             .iter()
             .filter(|(s, _)| s.channel_id() == channel_id)
             .map(|(_, q)| q.len())
-            .sum()
+            .sum::<usize>()
+            + self
+                .cancelled_batches
+                .iter()
+                .filter(|(scope, _)| scope.channel_id() == channel_id)
+                .map(|(_, events)| events.len())
+                .sum::<usize>()
+            + self
+                .withheld_native_steer
+                .iter()
+                .filter(|(scope, _)| scope.channel_id() == channel_id)
+                .map(|(_, events)| events.len())
+                .sum::<usize>()
     }
 
     /// Drop the globally-oldest queued event(s) across a channel's scopes until
@@ -555,6 +569,8 @@ impl EventQueue {
 
         // Merge any cancelled events stored by requeue_as_cancelled().
         let cancelled_events = self.cancelled_batches.remove(&scope).unwrap_or_default();
+        self.in_flight_batch_sizes
+            .insert(scope.clone(), events.len() + cancelled_events.len());
         let cancel_reason = if cancelled_events.is_empty() {
             self.cancel_reasons.remove(&scope);
             None
@@ -593,6 +609,7 @@ impl EventQueue {
                 self.retry_counts.remove(&scope);
                 self.usage_limit_holds.remove(&scope);
                 self.protected_events.remove(&scope);
+                self.usage_notices_saved.remove(&scope);
             }
         }
     }
@@ -644,6 +661,7 @@ impl EventQueue {
             self.usage_limit_holds.remove(&scope);
             self.usage_hold_deadlines.remove(&scope);
             self.protected_events.remove(&scope);
+            self.usage_notices_saved.remove(&scope);
             // Also clear retry_after so fresh traffic on this scope isn't
             // throttled by stale backoff from the discarded poison batch.
             self.retry_after.remove(&scope);
@@ -672,29 +690,7 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
-        let queue = self.queues.entry(scope.clone()).or_default();
-        // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
-            queue.push_front(QueuedEvent {
-                channel_id,
-                scope: scope.clone(),
-                event: be.event,
-                prompt_tag: be.prompt_tag,
-                received_at: be.received_at, // preserve original timestamp (#46)
-            });
-        }
-        // Enforce per-scope cap: trim oldest (back) events if requeue pushed
-        // the partition over the limit. Without this, repeated requeue+push
-        // cycles can grow the queue unboundedly.
-        while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                scope = %scope.telemetry_label(),
-                limit = MAX_PENDING_PER_SCOPE,
-                "requeue overflow — dropped oldest event to enforce cap"
-            );
-        }
+        self.requeue_preserve_timestamps(batch);
         self.retry_after.insert(scope, Instant::now() + delay);
         self.enforce_channel_cap(channel_id);
         None
@@ -751,6 +747,7 @@ impl EventQueue {
             self.usage_limit_holds.remove(&scope);
             self.usage_hold_deadlines.remove(&scope);
             self.protected_events.remove(&scope);
+            self.usage_notices_saved.remove(&scope);
             self.retry_counts.remove(&scope);
             self.retry_after.remove(&scope);
             return Some(batch);
@@ -768,7 +765,13 @@ impl EventQueue {
         self.protected_events
             .entry(scope.clone())
             .or_default()
-            .extend(batch.events.iter().map(|event| event.event.id));
+            .extend(
+                batch
+                    .events
+                    .iter()
+                    .chain(&batch.cancelled_events)
+                    .map(|event| event.event.id),
+            );
         self.requeue_preserve_timestamps(batch);
         self.retry_after.insert(scope, deadline);
         None
@@ -776,11 +779,28 @@ impl EventQueue {
 
     /// Number of consecutive usage-limit holds recorded for `scope` since its
     /// last successful turn (0 when none).
+    #[cfg(test)]
     pub fn usage_limit_holds<K: IntoScope>(&self, scope: K) -> u32 {
         self.usage_limit_holds
             .get(&scope.into_scope())
             .copied()
             .unwrap_or(0)
+    }
+
+    pub(crate) fn usage_notice_saved(&self, scope: &SessionScope) -> bool {
+        self.usage_notices_saved.contains(scope)
+    }
+
+    pub(crate) fn mark_usage_notice_saved(&mut self, scope: SessionScope) {
+        self.usage_notices_saved.insert(scope);
+    }
+
+    pub(crate) fn hold_account(&mut self, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        self.account_retry_after = Some(
+            self.account_retry_after
+                .map_or(deadline, |old| old.max(deadline)),
+        );
     }
 
     /// Next retry instant, including an elapsed deadline that has not yet
@@ -1045,6 +1065,12 @@ impl EventQueue {
             .map(|t| t.saturating_duration_since(Instant::now()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_retry_for_test(&mut self) {
+        self.retry_after.clear();
+        self.account_retry_after = None;
+    }
+
     /// Ids of the queued (not in-flight) events for a scope, head first.
     /// Test-only.
     #[cfg(test)]
@@ -1091,6 +1117,8 @@ impl EventQueue {
             .retain(|s, _| s.channel_id() != channel_id);
         self.protected_events
             .retain(|s, _| s.channel_id() != channel_id);
+        self.usage_notices_saved
+            .retain(|s| s.channel_id() != channel_id);
         self.cancelled_batches
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
@@ -1286,25 +1314,34 @@ impl EventQueue {
     /// expiry inline; this covers the `retry_after` and `retry_counts` maps.
     pub fn compact_expired_state(&mut self) {
         let now = Instant::now();
-        self.retry_after.retain(|_, deadline| *deadline > now);
+        // Keep due work's wake-up until the select timer consumes it.
+        self.retry_after.retain(|scope, deadline| {
+            *deadline > now
+                || self.queues.contains_key(scope)
+                || self.cancelled_batches.contains_key(scope)
+        });
         // Remove retry_counts for channels with no active throttle, no
         // queued events, AND no in-flight prompt — they completed their
         // retry cycle and are truly idle.
         self.retry_counts.retain(|scope, _| {
             self.retry_after.contains_key(scope)
                 || self.queues.get(scope).is_some_and(|q| !q.is_empty())
+                || self.cancelled_batches.contains_key(scope)
                 || self.in_flight_scopes.contains(scope)
         });
         // Same idleness rule for usage-limit hold counters.
         self.usage_limit_holds.retain(|scope, _| {
             self.retry_after.contains_key(scope)
                 || self.queues.get(scope).is_some_and(|q| !q.is_empty())
+                || self.cancelled_batches.contains_key(scope)
                 || self.in_flight_scopes.contains(scope)
         });
         self.protected_events
             .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
         self.usage_hold_deadlines
             .retain(|scope, _| self.usage_limit_holds.contains_key(scope));
+        self.usage_notices_saved
+            .retain(|scope| self.usage_limit_holds.contains_key(scope));
     }
 }
 

@@ -147,7 +147,16 @@ async fn deliver(rest: &RestClient, path: &Path, notice: &mut PendingNotice) -> 
         == Some(true))
 }
 
-async fn drain(rest: &RestClient, directory: &Path) -> Result<()> {
+async fn drain(rest: &RestClient, directory: &Path, cursor: &mut Option<PathBuf>) -> Result<()> {
+    drain_with_remove(rest, directory, cursor, |path| std::fs::remove_file(path)).await
+}
+
+async fn drain_with_remove(
+    rest: &RestClient,
+    directory: &Path,
+    cursor: &mut Option<PathBuf>,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     std::fs::create_dir_all(directory)?;
     let mut pending = Vec::new();
     for entry in std::fs::read_dir(directory)?.take(MAX_RECORDS + 1) {
@@ -170,9 +179,14 @@ async fn drain(rest: &RestClient, directory: &Path) -> Result<()> {
             }
         }
     }
-    // A permanently failing early directory entry must not starve newer
-    // records when a pass hits its network-attempt bound.
-    pending.sort_by_key(|(_, notice)| notice.next_attempt_at);
+    // Disk cleanup/schedule writes can fail even when reads and relay POSTs
+    // succeed. Advance a process-local cursor independently of those writes,
+    // so a permanently due record cannot monopolize each bounded pass.
+    pending.sort_by(|(left, _), (right, _)| left.cmp(right));
+    if let Some(previous) = cursor.as_ref() {
+        let next = pending.partition_point(|(path, _)| path <= previous);
+        pending.rotate_left(next);
+    }
     let mut attempted = 0;
     for (path, mut notice) in pending {
         let result = async {
@@ -186,10 +200,11 @@ async fn drain(rest: &RestClient, directory: &Path) -> Result<()> {
                 tracing::error!(path = %path.display(), "notice delivery expired; durable record retained");
                 return Ok(());
             }
+            *cursor = Some(path.clone());
             attempted += 1;
             match tokio::time::timeout(Duration::from_secs(10), deliver(rest, &path, &mut notice)).await {
                 Ok(Ok(true)) => {
-                    std::fs::remove_file(&path)?;
+                    remove(&path)?;
                     #[cfg(unix)]
                     std::fs::File::open(directory)?.sync_all()?;
                 }
@@ -213,16 +228,17 @@ async fn drain(rest: &RestClient, directory: &Path) -> Result<()> {
 }
 
 pub(crate) async fn run(rest: RestClient) {
-    let directory = match directory(&rest) {
-        Ok(directory) => directory,
-        Err(error) => {
-            tracing::error!(%error, "cannot open durable notice outbox");
-            return;
-        }
-    };
+    let mut cursor = None;
     loop {
-        if let Err(error) = drain(&rest, &directory).await {
-            tracing::error!(%error, "notice outbox scan failed; retrying");
+        match directory(&rest) {
+            Ok(directory) => {
+                if let Err(error) = drain(&rest, &directory, &mut cursor).await {
+                    tracing::error!(%error, "notice outbox scan failed; retrying");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "cannot open durable notice outbox; retrying");
+            }
         }
         tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
     }

@@ -4886,6 +4886,12 @@ fn handle_prompt_result(
     // retry_counts. If mark_complete runs first, retry_counts is cleared and
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
+    let usage_limit = usage_limit_from_outcome(&result.outcome);
+    if result.batch.is_none() {
+        if let Some(limit) = &usage_limit {
+            queue.hold_account(limit.hold_delay(chrono::Local::now()));
+        }
+    }
     if let Some(batch) = result.batch.take() {
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
@@ -4952,7 +4958,7 @@ fn handle_prompt_result(
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
-            } else if let Some(limit) = usage_limit_from_outcome(&result.outcome) {
+            } else if let Some(limit) = usage_limit {
                 // Provider usage limit: deterministic until the window resets,
                 // so hold the batch until then rather than burning the retry
                 // budget and discarding the event. Observed 2026-09-03: a
@@ -4974,14 +4980,15 @@ fn handle_prompt_result(
                     .last()
                     .map(|be| queue::parse_thread_tags(&be.event))
                     .unwrap_or_default();
-                let first_hold = queue.usage_limit_holds(&batch.scope) == 0;
+                let notice_scope = batch.scope.clone();
+                let notice_pending = !queue.usage_notice_saved(&notice_scope);
                 if let Some(dead) = queue.requeue_held(batch, delay) {
                     let content = format!(
                         "⚠️ I couldn't process the last request: the provider usage limit exceeded the supported retry window ({} days). Please re-send if it's still needed.\n\n{details}",
                         usage_limit::MAX_HOLD_SECS / 86_400
                     );
                     spawn_failure_notice(rest_client, &dead, content);
-                } else if first_hold {
+                } else if notice_pending {
                     // Tell the channel once per hold series why the agent has
                     // gone quiet, including the restart limitation.
                     let when = match &resets {
@@ -5001,6 +5008,8 @@ fn handle_prompt_result(
                             // storage error must not destroy its retry path.
                             tracing::error!(%channel_id, %error,
                                 "usage-limit notice was not saved; keeping held request alive");
+                        } else {
+                            queue.mark_usage_notice_saved(notice_scope);
                         }
                     }
                 }
@@ -5047,7 +5056,16 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
+        PromptSource::Channel(scope) => {
+            if matches!(
+                result.outcome,
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+            ) {
+                queue.release_in_flight(scope.clone());
+            } else {
+                queue.mark_complete(scope.clone());
+            }
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -11290,6 +11308,23 @@ mod error_outcome_emission_tests {
         error: AcpError,
         rest: Option<&relay::RestClient>,
     ) -> LoopAction {
+        run_prompt_error(
+            queue,
+            PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            Some(batch),
+            error,
+            rest,
+        )
+        .await
+    }
+
+    async fn run_prompt_error(
+        queue: &mut EventQueue,
+        source: PromptSource,
+        batch: Option<FlushBatch>,
+        error: AcpError,
+        rest: Option<&relay::RestClient>,
+    ) -> LoopAction {
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -11318,10 +11353,10 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            source,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(error),
-            batch: Some(batch),
+            batch,
         };
         handle_prompt_result(
             &mut pool,

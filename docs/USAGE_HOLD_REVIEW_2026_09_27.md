@@ -24,15 +24,39 @@
 
 ## 통지 저장 계약
 
+후속 cfeb496 리뷰 5328371745도 반영했다.
+
+| 인라인 ID | 처리 |
+| --- | --- |
+| 4113637058 | 최초 보류 횟수와 통지 저장 성공을 분리했다. 실패 시 pending을 유지해 다음 usage-limit 결과에서 저장을 다시 시도한다. 실제 저장 경로 차단→해제 후 두 번째 결과에서 파일 생성 확인. |
+| 4113637063 | batch 없는 heartbeat 결과도 usage-limit을 분류하고 계정 hold를 설정한다. 실제 결과 처리 후 다음 heartbeat dispatch가 작업자를 점유하지 않는지 확인. |
+| 4113637068 | cancelled/withheld를 채널 대기 수에 포함하고 merged batch의 실행 예약에 cancelled 수를 더한다. 일반 오류 복귀도 cancelled carryover를 복원한다. |
+| 4113637071 | `resets 3:10am UTC.`와 `resets 15:30 GMT;`, 괄호·offset 문장부호를 회귀에 포함하고 토큰 양끝 문장부호를 정규화한다. |
+| 4113637072 | 저장/삭제 성공과 독립적인 process-local cursor로 outbox를 순환한다. 33개 기록의 삭제를 모두 실패시켜도 두 pass에서 전부 전송되는 HTTP 회귀를 추가했다. HOME 경로 조회 실패도 worker를 종료하지 않고 재시도한다. |
+
+요청 상태별 대조는 다음과 같다. 일반 대기 큐의 기존 oldest-eviction 정책은 유지하고,
+실행 중 복귀분·보류 보호분·취소 carryover에는 신규 접수가 그 용량을 침범하지 못하게 한다.
+
+| 전이 | 용량·복구 처리 |
+| --- | --- |
+| queued → in-flight | 큐에서 빠진 events와 cancelled 전체 수를 실행 예약으로 옮긴다. |
+| in-flight → cancelled → merged | 기존 요청을 cancelled에 보관해 채널 총량에 포함한다. 재병합 시 실행 예약에 포함한다. |
+| in-flight → held / 일반 오류 / 작업자 대기 | 공통 복귀 함수로 events·cancelled·원래 시각을 복원한다. hold는 양쪽 ID를 보호한다. |
+| queued → withheld → released / consumed | withheld도 대기 총량에 포함한다. release는 같은 수를 큐로 옮기고 성공 확인 후에만 제거한다. |
+| 취소·작업자 대기 / 실제 완료 | 전자는 소유권만 해제해 hold 메타데이터를 보존한다. 후자는 기존 완료 정책으로 정리한다. |
+
+반복 취소로 500개 요청을 누적한 뒤 네 복귀 경로(held/retry/preserve/cancelled)를
+각각 검증한다. maintenance가 아직 소비되지 않은 retry wake-up을 지우지 않는 것도 확인한다.
+
 저장 위치는 `$HOME/.buzz/notice-outbox/<relay URL + agent pubkey의 SHA-256>/`다.
 새 외부 의존성이나 relay 스키마 변경 없이 기존 HTTP submit/query 경로를 사용한다.
 파일당 64 KiB, 디렉터리당 1,024개로 제한한다. 서명 이벤트를 임시 파일에 쓰고
 fsync·rename한 뒤 전송하며 Unix 파일 권한은 0600이다. 5초부터 최대 5분까지
-backoff하고 한 pass는 최대 32건을 처리한다. 오래 대기한 항목부터 선택한다.
+backoff하고 한 pass는 최대 32건을 순환 처리한다.
 8일 만료·손상·전송 실패 레코드는 삭제하지 않는다. 접수 성공이 확인된 기록만 지운다.
 한도가 차면 새 저장은 오류를 반환하며 운영자가 보존 레코드를 확인해야 한다.
-저장 자체가 실패한 통지는 자동 복구를 보장하지 않는다. 오류 로그를 남기되
-요청 처리 루프는 유지해 이미 접수된 요청의 재시도를 잃지 않는다.
+저장 자체가 실패한 통지는 다음 usage-limit 결과에서 다시 저장을 시도한다.
+그 전에 프로세스가 종료되면 복구를 보장하지 않는다. 요청 처리 루프는 유지한다.
 
 요청 큐 자체는 여전히 메모리 상태다. 통지 복구는 요청의 재시작 복구를 뜻하지 않는다.
 따라서 통지 본문은 보류 발생 시각과 당시 상태를 설명하고, harness 재시작 시 재전송이
@@ -40,6 +64,10 @@ backoff하고 한 pass는 최대 32건을 처리한다. 오래 대기한 항목�
 별도 harness들이 같은 provider 계정을 쓰는 경우의 전역 조율은 범위 밖이다.
 
 ## 검증 기록
+
+cfeb496 이후 다섯 건과 전이 경계 수정 트리의 전체 시험은 ACP 976 + integration 9 +
+core 258 + doctest 2, 총 1,245 PASS다. 로그는 `buzz-review-round3-final-tests.log`다.
+cfeb496 전체 CI는 후속 수정으로 중단했고, 새 커밋의 전체 CI·리뷰를 별도로 확인한다.
 
 e2af578 이후 추가 네 건의 수정 트리에서 전체 ACP 971 + integration 9 + core 258 +
 doctest 2, 총 1,240개가 통과했다. 용량 예약과 괄호 밖 시간대 회귀는 수정 전

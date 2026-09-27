@@ -195,6 +195,8 @@ fn has_explicit_timezone(reset_clause: &str) -> bool {
     reset_clause
         .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '·'))
         .any(|label| {
+            let label =
+                label.trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '+' | '-' | '/'));
             label.contains('/')
                 || label == "utc"
                 || label == "gmt"
@@ -323,6 +325,11 @@ mod tests {
     fn unparenthesized_timezone_uses_fallback() {
         for clock in [
             "3:10am UTC",
+            "3:10am UTC.",
+            "15:30 GMT;",
+            "15:30 (UTC).",
+            "15:30 [+09:00].",
+            "15:30 -0500;",
             "15:30 GMT",
             "15:30 +09:00",
             "15:30 -0500",
