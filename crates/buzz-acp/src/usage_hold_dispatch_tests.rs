@@ -44,6 +44,32 @@ async fn heartbeat_usage_error_holds_account_without_a_batch() {
     assert!(pool.any_idle());
 }
 
+#[tokio::test]
+async fn account_only_hold_notifies_once_then_dispatches_after_release() {
+    let rest = pool::test_prompt_context().rest_client;
+    let rest = relay::RestClient { keys: nostr::Keys::generate(), ..rest };
+    let mut queue = EventQueue::new(DedupMode::Queue);
+    run_prompt_error(&mut queue, PromptSource::Heartbeat, None, limit_error(), None).await;
+    let channel = Uuid::new_v4();
+    let scope = scope::SessionScope::Conversation { channel_id: channel };
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "first request"));
+    retry_terminal_notices(&mut queue, Some(&rest));
+    assert!(queue.usage_notice_scheduled(&scope));
+    assert!(queue.flush_next().is_none());
+    queue.requeue_preserve_timestamps(one_event_batch(channel, "follow-up"));
+    retry_terminal_notices(&mut queue, Some(&rest));
+    let path = notice_outbox::directory(&rest).unwrap();
+    let files: Vec<_> = std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(files.iter().filter(|path| path.extension().is_some_and(|ext| ext == "json")).count(), 1);
+    queue.expire_retry_for_test();
+    let batch = queue.flush_next().unwrap();
+    assert_eq!(batch.events.len(), 2);
+    queue.finish_request(scope.clone());
+    assert!(!queue.usage_notice_scheduled(&scope));
+    for file in files { std::fs::remove_file(file).unwrap(); }
+    std::fs::remove_dir(path).unwrap();
+}
+
 #[test]
 fn saturated_terminal_notice_retries_without_provider_dispatch() {
     const CHILD: &str = "BUZZ_TERMINAL_SATURATION_CHILD";
@@ -62,6 +88,15 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"storage unavailable").unwrap();
         let full = notice_outbox::saturate_retries_for_test();
+        let mut account_queue = EventQueue::new(DedupMode::Queue);
+        account_queue.hold_account(Duration::from_secs(3600));
+        let account_channel = Uuid::new_v4();
+        let account_scope = scope::SessionScope::Conversation { channel_id: account_channel };
+        account_queue.requeue_preserve_timestamps(one_event_batch(account_channel, "account hold"));
+        retry_terminal_notices(&mut account_queue, Some(&rest));
+        assert!(!account_queue.usage_notice_scheduled(&account_scope));
+        assert!(account_queue.next_retry_deadline().unwrap() <= std::time::Instant::now() + Duration::from_secs(5));
+        assert_eq!(account_queue.queued_event_count(account_channel), 1);
         let channel = Uuid::new_v4();
         let mut queue = EventQueue::new(DedupMode::Queue);
         let mut batch = one_event_batch(channel, "terminal");
@@ -90,6 +125,10 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         let idle_end = idle_start + Duration::from_secs(61);
         assert!(!inactivity_exit_due(idle_start, idle_end, Duration::from_secs(60), &queue, false));
         std::fs::remove_file(&path).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        retry_terminal_notices(&mut account_queue, Some(&rest));
+        assert!(account_queue.usage_notice_scheduled(&account_scope));
+        assert!(account_queue.flush_next().is_none());
         queue.make_terminal_notices_due_for_test();
         retry_terminal_notices(&mut queue, Some(&rest));
         assert!(queue.next_retry_deadline().is_none());
@@ -97,7 +136,7 @@ fn saturated_terminal_notice_retries_without_provider_dispatch() {
         assert!(inactivity_exit_due(idle_start, idle_end, Duration::from_secs(60), &queue, false));
         assert!(queue.flush_next().is_none());
         let files: Vec<_> = std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()).collect();
-        assert_eq!(files.iter().filter(|path| path.extension().is_some_and(|ext| ext == "json")).count(), 1);
+        assert_eq!(files.iter().filter(|path| path.extension().is_some_and(|ext| ext == "json")).count(), 2);
         for file in files { std::fs::remove_file(file).unwrap(); }
         std::fs::remove_dir(path).unwrap();
     });

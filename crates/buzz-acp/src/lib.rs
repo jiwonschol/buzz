@@ -4733,6 +4733,27 @@ fn retry_terminal_notices(queue: &mut EventQueue, rest: Option<&relay::RestClien
     for (batch, content, event) in queue.take_due_terminal_notices() {
         save_terminal_notice_event(queue, rest, batch, content, event);
     }
+    for pending in queue.account_notice_candidates() {
+        let content = format!(
+            "⏳ At {}, the provider account usage limit paused this request. It was queued for automatic retry after the account hold ends while this harness stays running. If the harness restarts, please re-send. This notice may arrive late and does not confirm completion.",
+            chrono::Utc::now().to_rfc3339()
+        );
+        let saved = rest
+            .context("usage notice transport unavailable")
+            .and_then(|rest| {
+                pool::build_failure_notice(
+                    rest,
+                    pending.channel_id,
+                    &queue::parse_thread_tags(&pending.event),
+                    &content,
+                )
+                .and_then(|event| notice_outbox::persist_or_retry(rest, event))
+            });
+        match saved {
+            Ok(_) => queue.mark_usage_notice_scheduled(pending.scope),
+            Err(error) => tracing::error!(%error, "account hold notice remains pending for retry"),
+        }
+    }
 }
 
 fn save_terminal_notice(

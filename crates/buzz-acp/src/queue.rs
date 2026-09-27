@@ -239,6 +239,7 @@ pub struct EventQueue {
     usage_notices_scheduled: HashSet<SessionScope>,
     /// All scopes share the provider account behind this harness.
     account_retry_after: Option<Instant>,
+    account_notice_retry: Option<Instant>,
     terminal_notices: Vec<(FlushBatch, String, Option<nostr::Event>)>,
     terminal_notice_retry: Option<Instant>,
     dedup_mode: DedupMode,
@@ -286,6 +287,7 @@ impl EventQueue {
             protected_events: HashMap::new(),
             usage_notices_scheduled: HashSet::new(),
             account_retry_after: None,
+            account_notice_retry: None,
             terminal_notices: Vec::new(),
             terminal_notice_retry: None,
             dedup_mode,
@@ -810,6 +812,29 @@ impl EventQueue {
         self.usage_notices_scheduled.insert(scope);
     }
 
+    pub(crate) fn account_notice_candidates(&mut self) -> Vec<QueuedEvent> {
+        if !self.is_account_held() {
+            self.account_notice_retry = None;
+            return Vec::new();
+        }
+        if self
+            .account_notice_retry
+            .is_some_and(|at| at > Instant::now())
+        {
+            return Vec::new();
+        }
+        let candidates: Vec<_> = self
+            .queues
+            .iter()
+            .filter(|(scope, _)| !self.usage_notices_scheduled.contains(*scope))
+            .filter_map(|(_, events)| events.front().cloned())
+            .take(32)
+            .collect();
+        self.account_notice_retry =
+            (!candidates.is_empty()).then(|| Instant::now() + Duration::from_secs(5));
+        candidates
+    }
+
     pub(crate) fn hold_account(&mut self, delay: Duration) {
         let deadline = Instant::now() + delay;
         self.account_retry_after = Some(
@@ -834,6 +859,7 @@ impl EventQueue {
                     .max()
             })
             .chain(self.terminal_notice_retry)
+            .chain(self.account_notice_retry)
             .min()
     }
 
