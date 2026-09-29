@@ -196,8 +196,12 @@ test("set status dialog uses the desktop modal with shared status choices", asyn
 test("keeps an open status draft when the saved status expires", async ({
   page,
 }) => {
+  const now = new Date("2026-09-28T12:00:00Z");
+  // Keep the saved status alive until editing starts, even on a slow CI worker.
+  // Real timers still run so the subscription processes expiration normally.
+  await page.clock.setFixedTime(now);
   await page.goto("/");
-  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const nowSeconds = Math.floor(now.getTime() / 1_000);
   await seedMockStatus(page, {
     text: "Original draft",
     emoji: "📝",
@@ -207,6 +211,8 @@ test("keeps an open status draft when the saved status expires", async ({
   await page.getByTestId("profile-popover-set-status").click();
   const dialog = page.getByTestId("set-status-dialog");
   await dialog.getByTestId("set-status-input").fill("Unsaved draft");
+  await expect(page.getByTestId("sidebar-profile-user-status")).toBeVisible();
+  await page.clock.setFixedTime(new Date(now.getTime() + 2_001));
   await expect(page.getByTestId("sidebar-profile-user-status")).toHaveCount(0, {
     timeout: 5_000,
   });
