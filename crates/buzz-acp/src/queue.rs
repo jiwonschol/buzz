@@ -968,11 +968,29 @@ impl EventQueue {
     }
 
     pub(crate) fn hold_account(&mut self, delay: Duration) {
+        let now = Instant::now();
         if !self.is_account_held() {
             self.account_hold_generation = self.account_hold_generation.wrapping_add(1);
             self.account_notice_retry = None;
+            // Backlog starts waiting on the provider now, even if it has not
+            // dispatched yet. Earlier hold windows must never be restarted.
+            let window_end = now + Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS);
+            for (scope, id) in self
+                .queues
+                .iter()
+                .flat_map(|(scope, events)| events.iter().map(move |event| (scope, event.event.id)))
+                .chain(self.cancelled_batches.iter().flat_map(|(scope, events)| {
+                    events.iter().map(move |event| (scope, event.event.id))
+                }))
+            {
+                self.usage_hold_deadlines
+                    .entry(scope.clone())
+                    .or_default()
+                    .entry(id)
+                    .or_insert(window_end);
+            }
         }
-        let deadline = Instant::now() + delay;
+        let deadline = now + delay;
         self.account_retry_after = Some(
             self.account_retry_after
                 .map_or(deadline, |old| old.max(deadline)),

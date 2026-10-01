@@ -1,6 +1,52 @@
 // ── usage-limit hold ──────────────────────────────────────────────────
 
 #[test]
+fn account_hold_starts_backlog_windows_without_extending_them() {
+    for state in ["queued", "retry", "cancelled"] {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let limited = Uuid::new_v4();
+        q.push(make_queued(limited, "provider limit"));
+        let limited_batch = q.flush_next().unwrap();
+        let channel = Uuid::new_v4();
+        let mut pending = make_queued(channel, state);
+        let window = Duration::from_secs(crate::usage_limit::MAX_HOLD_SECS);
+        // Ordinary backlog age does not consume the usage-limit window.
+        pending.received_at = Instant::now() - window - Duration::from_secs(1);
+        let id = pending.event.id;
+        q.push(pending);
+        if state != "queued" {
+            let batch = q.flush_next().unwrap();
+            if state == "retry" {
+                assert!(q.requeue(batch).is_none());
+            } else {
+                q.requeue_as_cancelled(batch, CancelReason::Steer);
+            }
+            q.release_in_flight(channel);
+        }
+        let earliest = Instant::now() + window;
+        assert!(q.requeue_held(limited_batch, window).is_none());
+        q.release_in_flight(limited);
+        let deadline = q.usage_hold_deadlines.get(&conv(channel)).and_then(|windows| windows.get(&id)).copied();
+        assert!(deadline.is_some_and(|at| at >= earliest && at <= Instant::now() + window), "{state}");
+        assert!(q.take_expired_requests().is_empty());
+
+        let expired_at = Instant::now();
+        q.usage_hold_deadlines.get_mut(&conv(channel)).unwrap().insert(id, expired_at);
+        q.hold_account(window);
+        assert_eq!(q.usage_hold_deadlines[&conv(channel)][&id], expired_at);
+        q.expire_retry_for_test();
+        q.hold_account(window);
+        assert_eq!(q.usage_hold_deadlines[&conv(channel)][&id], expired_at);
+        let expired = q.take_expired_requests();
+        assert_eq!(expired.len(), 1, "{state}");
+        assert_eq!(expired[0].events.iter().chain(&expired[0].cancelled_events).map(|event| event.event.id).collect::<Vec<_>>(), vec![id]);
+        assert_eq!(expired[0].cancelled_events.len(), usize::from(state == "cancelled"));
+        assert!(q.is_account_held());
+        assert!(q.flush_next().is_none());
+    }
+}
+
+#[test]
 fn request_expiry_wakes_before_another_scopes_account_hold() {
     let mut q = EventQueue::new(DedupMode::Queue);
     let channel = Uuid::new_v4();
