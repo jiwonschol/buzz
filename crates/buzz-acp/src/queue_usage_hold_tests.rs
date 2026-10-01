@@ -2,7 +2,7 @@
 
 #[test]
 fn account_hold_starts_backlog_windows_without_extending_them() {
-    for state in ["queued", "retry", "cancelled"] {
+    for state in ["queued", "retry", "cancelled", "steer-release", "steer-recovery", "steer-consumed"] {
         let mut q = EventQueue::new(DedupMode::Queue);
         let limited = Uuid::new_v4();
         q.push(make_queued(limited, "provider limit"));
@@ -14,7 +14,9 @@ fn account_hold_starts_backlog_windows_without_extending_them() {
         pending.received_at = Instant::now() - window - Duration::from_secs(1);
         let id = pending.event.id;
         q.push(pending);
-        if state != "queued" {
+        if state.starts_with("steer-") {
+            assert!(q.mark_native_steer_pending(channel, &id.to_hex()));
+        } else if state != "queued" {
             let batch = q.flush_next().unwrap();
             if state == "retry" {
                 assert!(q.requeue(batch).is_none());
@@ -29,6 +31,15 @@ fn account_hold_starts_backlog_windows_without_extending_them() {
         let deadline = q.usage_hold_deadlines.get(&conv(channel)).and_then(|windows| windows.get(&id)).copied();
         assert!(deadline.is_some_and(|at| at >= earliest && at <= Instant::now() + window), "{state}");
         assert!(q.take_expired_requests().is_empty());
+        q.compact_expired_state();
+        assert_eq!(q.usage_hold_deadlines[&conv(channel)][&id], deadline.unwrap());
+
+        if state == "steer-consumed" {
+            q.remove_event(channel, &id.to_hex());
+            assert!(!q.usage_hold_deadlines.contains_key(&conv(channel)));
+            assert!(q.take_expired_requests().is_empty());
+            continue;
+        }
 
         let expired_at = Instant::now();
         q.usage_hold_deadlines.get_mut(&conv(channel)).unwrap().insert(id, expired_at);
@@ -37,6 +48,19 @@ fn account_hold_starts_backlog_windows_without_extending_them() {
         q.expire_retry_for_test();
         q.hold_account(window);
         assert_eq!(q.usage_hold_deadlines[&conv(channel)][&id], expired_at);
+        if state.starts_with("steer-") {
+            // Pending delivery remains owned by the steer result, even after expiry.
+            assert!(q.take_expired_requests().is_empty());
+            if state == "steer-release" {
+                q.release_native_steer(channel, &id.to_hex());
+            } else {
+                q.in_flight_scopes.insert(conv(channel));
+                q.in_flight_deadlines.insert(conv(channel), Instant::now() - Duration::from_secs(1));
+                assert!(!q.has_flushable_work());
+            }
+            assert_eq!(q.usage_hold_deadlines[&conv(channel)][&id], expired_at);
+            assert!(q.next_retry_deadline().is_some_and(|at| at <= Instant::now()));
+        }
         let expired = q.take_expired_requests();
         assert_eq!(expired.len(), 1, "{state}");
         assert_eq!(expired[0].events.iter().chain(&expired[0].cancelled_events).map(|event| event.event.id).collect::<Vec<_>>(), vec![id]);

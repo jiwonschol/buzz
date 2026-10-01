@@ -982,6 +982,13 @@ impl EventQueue {
                 .chain(self.cancelled_batches.iter().flat_map(|(scope, events)| {
                     events.iter().map(move |event| (scope, event.event.id))
                 }))
+                .chain(
+                    self.withheld_native_steer
+                        .iter()
+                        .flat_map(|(scope, events)| {
+                            events.iter().map(move |event| (scope, event.event.id))
+                        }),
+                )
             {
                 self.usage_hold_deadlines
                     .entry(scope.clone())
